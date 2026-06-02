@@ -1,54 +1,50 @@
-# Vortexo Manifest Server
+# Vortexo Server
 
-A clean Vortexo backend for Apple TV that starts empty and becomes useful when
-you install Stremio-compatible manifests.
+Vortexo Server is a self-hosted companion backend for the Vortexo Apple TV app.
 
-The Apple TV app keeps using the existing Vortexo Server settings:
+It provides a simple first-run setup wizard that lets users install and manage manifest URLs for catalog metadata and playback sources. Vortexo Apple TV can then connect to this server and use those manifests for Home rows, metadata, and stream/source lookup.
 
-- `GET /api/v1/vortexo/home`
-- `POST /api/v1/vortexo/sources`
-- `GET /api/v1/vortexo/play/{token}`
+## What it does
 
-Install an AIOMetadata-style manifest for catalog rows and an AIOStreams-style
-manifest for source lookup. The server hides manifest/provider details from the
-Apple TV app and exposes only the Vortexo API.
+Vortexo Server helps turn a clean server into a working Vortexo backend.
 
-## First Run Wizard
+It supports:
 
-Open the server in a browser to use the setup wizard. It walks through:
+- AIOMetadata-style catalog manifests
+- AIOStreams-style stream manifests
+- Debrid-backed playback sources
+- Real-Debrid, TorBox, Premiumize, AllDebrid, and other providers supported by your AIOStreams instance
+- Optional TMDB, TVDB, Gemini, and RPDB configuration
+- Easy Apple TV connection using one server URL
+- Installed manifest management
 
-- Signing in with the bridge credentials
-- Preparing debrid, TMDB, TVDB, Gemini, and RPDB account requirements
-- Generating an AIOMetadata catalog manifest from Vortexo's compact preset
-- Generating an AIOStreams source manifest from Vortexo's compact preset
-- Pasting existing manifest URLs manually when you want a custom external setup
-- Installing those manifests into Vortexo Bridge
-- Connecting the Vortexo Apple TV app to the same server URL
+## How it works
 
-Vortexo Bridge stores installed manifest URLs. Third-party keys are sent to the
-selected upstream addon instances only to create their normal manifest
-configuration.
+1. Sign in to Vortexo Server.
+2. Prepare your accounts and optional API keys.
+3. Create or paste your catalog manifest URL.
+4. Create or paste your stream manifest URL.
+5. Install the manifests into Vortexo Server.
+6. Open Vortexo Apple TV.
+7. Go to Settings → Servers.
+8. Enable Vortexo Server and connect using your server URL.
 
-The setup endpoint is available at:
+## Privacy
 
-- `POST /api/v1/bridge/perfect-setup`
+Vortexo Server stores only the installed manifest URLs.
 
-## Local Run
+Debrid, TMDB, TVDB, Gemini, and RPDB keys stay inside the upstream addon configurations you create. Vortexo Server does not need to store those keys directly.
 
-```bash
-go run .
-```
+## Catalogs
 
-Default credentials:
+Catalog manifests are used by Vortexo Apple TV to create landscape Home rows and metadata-driven browsing sections.
 
-- Username: `vortexo`
-- Password: `vortexo`
+## Playback
 
-Override with:
+Stream manifests are used by Vortexo Apple TV for source lookup when opening movies and episodes.
 
-```bash
-VORTEXO_ADMIN_USERNAME=myuser VORTEXO_ADMIN_PASSWORD=mypass go run .
-```
+If a manifest returns only torrent hashes, those sources are skipped until a debrid-backed playable URL is returned.
 
-Persistent data is stored in `VORTEXO_DATA_DIR`, defaulting to `/data` in
-Docker and `./data` if supplied locally.
+## Project status
+
+This project is in early development. Features, setup steps, and behavior may change as Vortexo Server improves.
