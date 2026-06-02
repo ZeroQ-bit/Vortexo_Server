@@ -13,6 +13,20 @@ Install an AIOMetadata-style manifest for catalog rows and an AIOStreams-style
 manifest for source lookup. The server hides manifest/provider details from the
 Apple TV app and exposes only the Vortexo API.
 
+## First Run Wizard
+
+Open the server in a browser to use the setup wizard. It walks through:
+
+- Signing in with the bridge credentials
+- Preparing debrid, TMDB, TVDB, Gemini, and RPDB account requirements
+- Creating or pasting an AIOMetadata catalog manifest
+- Creating or pasting an AIOStreams source manifest
+- Installing those manifests into Vortexo Bridge
+- Connecting the Vortexo Apple TV app to the same server URL
+
+Vortexo Bridge stores installed manifest URLs. Third-party keys remain in the
+upstream addon configurations that generated those manifests.
+
 ## Local Run
 
 ```bash

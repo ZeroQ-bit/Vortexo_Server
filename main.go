@@ -1124,75 +1124,321 @@ const indexHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vortexo Manifest Server</title>
   <style>
-    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #08090b; color: #f5f7fb; }
-    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 20% 0%, #18324a 0, #08090b 35rem); }
-    main { max-width: 980px; margin: 0 auto; padding: 48px 24px; }
-    h1 { font-size: 40px; margin: 0 0 8px; }
-    p { color: #b8c1ce; line-height: 1.55; }
-    .panel { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.12); border-radius: 12px; padding: 20px; margin: 18px 0; }
-    label { display: block; margin: 12px 0 6px; color: #d9e0ea; }
-    input { width: 100%; box-sizing: border-box; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(0,0,0,.35); color: white; padding: 12px; font-size: 16px; }
-    button { border: 0; border-radius: 8px; background: #2997ff; color: white; padding: 11px 15px; font-weight: 700; cursor: pointer; margin-top: 12px; }
-    button.secondary { background: rgba(255,255,255,.12); }
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #090812; color: #f7f6ff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #090812; }
+    body:before { content: ""; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(circle at 18% 0%, rgba(74,125,255,.24), transparent 30rem), radial-gradient(circle at 88% 12%, rgba(124,83,255,.18), transparent 28rem); }
+    button, input, select { font: inherit; }
+    button { border: 0; border-radius: 10px; background: #5b8cff; color: white; padding: 12px 16px; font-weight: 800; cursor: pointer; }
+    button.secondary { background: rgba(255,255,255,.1); color: #f7f6ff; }
+    button.ghost { background: transparent; color: #b8c3ff; border: 1px solid rgba(184,195,255,.22); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    input, select { width: 100%; border: 1px solid rgba(255,255,255,.14); border-radius: 10px; background: rgba(0,0,0,.28); color: white; padding: 12px 13px; font-size: 15px; outline: none; }
+    input:focus, select:focus { border-color: rgba(124,156,255,.75); box-shadow: 0 0 0 3px rgba(91,140,255,.16); }
+    label { display: block; margin: 14px 0 7px; color: #d9ddff; font-weight: 700; }
+    a { color: #9eb8ff; text-decoration: none; }
     code { color: #9cdcfe; }
-    .row { display: flex; align-items: center; gap: 12px; justify-content: space-between; padding: 12px 0; border-top: 1px solid rgba(255,255,255,.1); }
-    .muted { color: #8b96a7; font-size: 14px; }
+    .shell { position: relative; display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: 100vh; }
+    .side { border-right: 1px solid rgba(255,255,255,.1); background: rgba(20,16,39,.78); padding: 28px 22px; }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
+    .brandMark { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; background: #0a7dff; font-weight: 900; }
+    h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
+    .subtitle, .muted { color: #aeb5d8; line-height: 1.55; }
+    .steps { display: grid; gap: 8px; margin: 28px 0; }
+    .step { display: flex; align-items: center; gap: 10px; width: 100%; padding: 13px 12px; border-radius: 10px; color: #bdc2e8; background: transparent; text-align: left; border: 1px solid transparent; }
+    .step.active { color: white; border-color: rgba(124,156,255,.65); background: rgba(124,156,255,.12); }
+    .dot { width: 11px; height: 11px; border: 1px solid rgba(255,255,255,.22); border-radius: 999px; }
+    .step.done .dot { background: #70e3a3; border-color: #70e3a3; }
+    .fineprint { margin-top: auto; padding-top: 24px; font-size: 13px; color: #8991b6; line-height: 1.5; }
+    main { padding: 38px clamp(26px, 5vw, 72px); }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 24px; }
+    .statusPill { border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.07); padding: 9px 12px; border-radius: 999px; color: #b9c1e7; font-size: 14px; }
+    .stage { max-width: 1120px; }
+    .panel { background: rgba(255,255,255,.075); border: 1px solid rgba(255,255,255,.12); border-radius: 14px; padding: 24px; margin: 16px 0; }
+    .hero { padding: 34px; text-align: center; }
+    .hero h2 { margin: 0 0 12px; font-size: clamp(30px, 4vw, 48px); letter-spacing: 0; }
+    .hero p { max-width: 760px; margin: 10px auto; color: #c4c9e7; line-height: 1.6; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .card { border: 1px solid rgba(255,255,255,.12); border-radius: 12px; padding: 18px; background: rgba(0,0,0,.18); }
+    .card h3 { margin: 0 0 7px; }
+    .card p { margin: 0; color: #b7bedf; line-height: 1.5; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    .pane { display: none; }
+    .pane.active { display: block; }
+    .two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .checklist { display: grid; gap: 10px; margin-top: 14px; }
+    .check { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border-radius: 10px; background: rgba(255,255,255,.06); color: #d7dcfa; }
+    .check input { width: auto; margin-top: 3px; }
     .ok { color: #7ee787; }
     .error { color: #ff8a8a; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 0; border-top: 1px solid rgba(255,255,255,.1); }
+    .row:first-child { border-top: 0; }
+    .url { overflow-wrap: anywhere; color: #aeb8dd; font-size: 13px; }
+    .message { min-height: 22px; margin-top: 12px; }
+    @media (max-width: 860px) {
+      .shell { grid-template-columns: 1fr; }
+      .side { position: static; border-right: 0; border-bottom: 1px solid rgba(255,255,255,.1); }
+      .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid, .two { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-<main>
-  <h1>Vortexo Manifest Server</h1>
-  <p>A clean Vortexo backend for Apple TV. Install Stremio-compatible manifests here, then connect the Vortexo app with this server URL, username, and password.</p>
-  <div class="panel">
-    <h2>1. Sign In</h2>
-    <p>Default Umbrel credentials are <code>vortexo</code> / <code>vortexo</code> unless changed by environment variables.</p>
-    <label>Username</label><input id="username" value="vortexo" autocomplete="username">
-    <label>Password</label><input id="password" type="password" value="vortexo" autocomplete="current-password">
-    <button onclick="login()">Sign In</button>
-    <span id="loginStatus" class="muted"></span>
-  </div>
-  <div class="panel">
-    <h2>2. Install Manifests</h2>
-    <p>Install an AIOMetadata manifest for Home rows and an AIOStreams manifest for source lookup. The Apple TV app reads only Vortexo's existing API.</p>
-    <label>Manifest URL</label><input id="manifestUrl" placeholder="https://example.com/your-config/manifest.json">
-    <label>Name</label><input id="manifestName" placeholder="AIOStreams or AIOMetadata">
-    <button onclick="addManifest()">Install Manifest</button>
-    <button class="secondary" onclick="loadManifests()">Refresh</button>
-    <p id="manifestStatus" class="muted"></p>
-    <div id="manifestList"></div>
-  </div>
-  <div class="panel">
-    <h2>3. Connect Apple TV</h2>
-    <p>In Vortexo Apple TV settings, enable Vortexo Server and use this Umbrel app URL. The app will call <code>/api/v1/vortexo/home</code> and <code>/api/v1/vortexo/sources</code>.</p>
-  </div>
-</main>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <div class="brandMark">V</div>
+      <div>
+        <h1>Vortexo Bridge</h1>
+        <div class="subtitle">Manifest setup wizard</div>
+      </div>
+    </div>
+    <div class="steps">
+      <button class="step active" data-step="welcome" onclick="showStep('welcome')"><span class="dot"></span><span>Welcome</span></button>
+      <button class="step" data-step="signin" onclick="showStep('signin')"><span class="dot"></span><span>Sign In</span></button>
+      <button class="step" data-step="accounts" onclick="showStep('accounts')"><span class="dot"></span><span>Accounts</span></button>
+      <button class="step" data-step="catalogs" onclick="showStep('catalogs')"><span class="dot"></span><span>Catalogs</span></button>
+      <button class="step" data-step="streams" onclick="showStep('streams')"><span class="dot"></span><span>Streams</span></button>
+      <button class="step" data-step="install" onclick="showStep('install')"><span class="dot"></span><span>Install</span></button>
+      <button class="step" data-step="finish" onclick="showStep('finish')"><span class="dot"></span><span>Finish</span></button>
+    </div>
+    <div class="fineprint">
+      Vortexo Bridge stores only installed manifest URLs. Debrid, TMDB, TVDB, Gemini, and RPDB keys stay inside the upstream addon configurations you create.
+    </div>
+  </aside>
+  <main>
+    <div class="topbar">
+      <div>
+        <div class="subtitle">First-run setup for Vortexo Apple TV</div>
+        <h1>Build your manifest-powered server</h1>
+      </div>
+      <div id="authPill" class="statusPill">Signed out</div>
+    </div>
+    <section class="stage">
+      <div id="welcome" class="pane active">
+        <div class="panel hero">
+          <h2>Welcome to Vortexo Bridge</h2>
+          <p>This wizard helps you turn a clean server into a working Vortexo backend. You create or paste AIOStreams and AIOMetadata manifests, then the Apple TV app keeps using the same Vortexo Server settings you already have.</p>
+          <div class="grid" style="text-align:left; margin-top:24px;">
+            <div class="card">
+              <h3>Catalogs</h3>
+              <p>AIOMetadata-style manifests become landscape Home rows in Vortexo.</p>
+            </div>
+            <div class="card">
+              <h3>Playback</h3>
+              <p>AIOStreams-style manifests become source lookup for movies and episodes.</p>
+            </div>
+          </div>
+          <div class="actions" style="justify-content:center;">
+            <button onclick="showStep('signin')">Start Setup</button>
+            <button class="secondary" onclick="showStep('install')">I already have manifest URLs</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="signin" class="pane">
+        <div class="panel">
+          <h2>Sign In</h2>
+          <p class="muted">Default Umbrel credentials are <code>vortexo</code> / <code>vortexo</code> unless changed by environment variables.</p>
+          <div class="two">
+            <div>
+              <label>Username</label>
+              <input id="username" value="vortexo" autocomplete="username">
+            </div>
+            <div>
+              <label>Password</label>
+              <input id="password" type="password" value="vortexo" autocomplete="current-password">
+            </div>
+          </div>
+          <div class="actions">
+            <button onclick="login()">Sign In</button>
+            <button class="secondary" onclick="loadManifests()">Refresh Session</button>
+          </div>
+          <div id="loginStatus" class="message muted"></div>
+        </div>
+      </div>
+
+      <div id="accounts" class="pane">
+        <div class="panel">
+          <h2>Prepare Accounts and Keys</h2>
+          <p class="muted">Use this as a checklist before creating your upstream addon configs. Vortexo Bridge does not need these keys directly; AIOStreams and AIOMetadata ask for them when you create their manifest URLs.</p>
+          <div class="checklist">
+            <label class="check"><input type="checkbox" data-check="debrid"><span><strong>Debrid account</strong><br><span class="muted">Real-Debrid, TorBox, Premiumize, AllDebrid, or another provider supported by your AIOStreams instance.</span></span></label>
+            <label class="check"><input type="checkbox" data-check="tmdb"><span><strong>TMDB key</strong><br><span class="muted">Helps metadata and catalog quality when your AIOMetadata instance requests it.</span></span></label>
+            <label class="check"><input type="checkbox" data-check="tvdb"><span><strong>TVDB key</strong><br><span class="muted">Useful for TV matching and richer series metadata if your instance supports it.</span></span></label>
+            <label class="check"><input type="checkbox" data-check="gemini"><span><strong>Gemini key</strong><br><span class="muted">Optional. Some AIOMetadata search or recommendations features may use it.</span></span></label>
+            <label class="check"><input type="checkbox" data-check="rpdb"><span><strong>RPDB key</strong><br><span class="muted">Optional poster ratings. Many guides use the free key <code>t0-free-rpdb</code>.</span></span></label>
+          </div>
+          <div class="actions">
+            <button onclick="saveChecklist(); showStep('catalogs')">Continue</button>
+            <button class="secondary" onclick="saveChecklist()">Save Checklist</button>
+          </div>
+          <div id="accountStatus" class="message muted"></div>
+        </div>
+      </div>
+
+      <div id="catalogs" class="pane">
+        <div class="panel">
+          <h2>Create Catalog Manifest</h2>
+          <p class="muted">Open an AIOMetadata instance, import or create your catalog setup, save it, then copy the final manifest URL. This is what Vortexo uses for Home rows.</p>
+          <div class="grid">
+            <div class="card">
+              <h3>AIOMetadata</h3>
+              <p>Create a catalog and metadata configuration, then copy the manifest URL after saving.</p>
+              <div class="actions">
+                <a href="https://aiometadata.viren070.me/" target="_blank" rel="noreferrer"><button>Open Viren Instance</button></a>
+                <a href="https://aiometadatafortheweebs.midnightignite.me/" target="_blank" rel="noreferrer"><button class="secondary">Open Midnight Instance</button></a>
+              </div>
+            </div>
+            <div class="card">
+              <h3>What to copy</h3>
+              <p>Copy the URL ending in <code>/manifest.json</code>. Paste it in the Install step as the catalog manifest.</p>
+            </div>
+          </div>
+          <label>Catalog manifest URL</label>
+          <input id="catalogManifestUrl" placeholder="https://aiometadata.example/stremio/.../manifest.json">
+          <div class="actions">
+            <button onclick="saveDraft(); showStep('streams')">Continue</button>
+            <button class="secondary" onclick="saveDraft()">Save Draft</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="streams" class="pane">
+        <div class="panel">
+          <h2>Create Stream Manifest</h2>
+          <p class="muted">Open an AIOStreams instance, configure providers and sorting, save it, then copy the final manifest URL. This is what Vortexo uses for source lookup.</p>
+          <div class="grid">
+            <div class="card">
+              <h3>AIOStreams</h3>
+              <p>Configure stream providers, debrid, timeouts, filters, and source formatting.</p>
+              <div class="actions">
+                <a href="https://aiostreams.viren070.me/" target="_blank" rel="noreferrer"><button>Open Viren Instance</button></a>
+                <a href="https://aiostreams.elfhosted.com/" target="_blank" rel="noreferrer"><button class="secondary">Open ElfHosted Instance</button></a>
+              </div>
+            </div>
+            <div class="card">
+              <h3>Vortexo behavior</h3>
+              <p>The bridge reads stream URLs from the manifest and converts them to Vortexo playback links. If an addon returns only torrent hashes, those are skipped until a debrid-backed URL is returned.</p>
+            </div>
+          </div>
+          <label>Stream manifest URL</label>
+          <input id="streamManifestUrl" placeholder="https://aiostreams.example/stremio/.../manifest.json">
+          <div class="actions">
+            <button onclick="saveDraft(); showStep('install')">Continue</button>
+            <button class="secondary" onclick="saveDraft()">Save Draft</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="install" class="pane">
+        <div class="panel">
+          <h2>Install Into Vortexo Bridge</h2>
+          <p class="muted">Sign in first, then install one or both manifest URLs. You can come back later and replace them without changing the Apple TV app.</p>
+          <div class="two">
+            <div>
+              <label>Catalog manifest URL</label>
+              <input id="installCatalogUrl" placeholder="AIOMetadata manifest URL">
+            </div>
+            <div>
+              <label>Stream manifest URL</label>
+              <input id="installStreamUrl" placeholder="AIOStreams manifest URL">
+            </div>
+          </div>
+          <div class="actions">
+            <button onclick="installSetup()">Install Setup</button>
+            <button class="secondary" onclick="loadManifests()">Refresh Installed</button>
+          </div>
+          <div id="manifestStatus" class="message muted"></div>
+        </div>
+        <div class="panel">
+          <h2>Installed Manifests</h2>
+          <div id="manifestList" class="muted">Sign in to view installed manifests.</div>
+        </div>
+        <div class="panel">
+          <h2>Manual Install</h2>
+          <label>Manifest URL</label>
+          <input id="manifestUrl" placeholder="https://example.com/your-config/manifest.json">
+          <label>Name</label>
+          <input id="manifestName" placeholder="AIOStreams or AIOMetadata">
+          <div class="actions">
+            <button class="secondary" onclick="addManifest()">Install One Manifest</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="finish" class="pane">
+        <div class="panel hero">
+          <h2>Connect Vortexo Apple TV</h2>
+          <p>In Vortexo settings, enable Vortexo Server and connect to this server URL with the same username and password.</p>
+          <div class="card" style="text-align:left;">
+            <h3>Server URL</h3>
+            <div id="serverUrl" class="url"></div>
+          </div>
+          <div class="actions" style="justify-content:center;">
+            <button onclick="copyServerUrl()">Copy Server URL</button>
+            <button class="secondary" onclick="showStep('install')">Manage Manifests</button>
+          </div>
+          <div id="finishStatus" class="message muted"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
 <script>
 let token = localStorage.getItem("vortexoToken") || "";
+const stepOrder = ["welcome", "signin", "accounts", "catalogs", "streams", "install", "finish"];
+function showStep(id) {
+  document.querySelectorAll(".pane").forEach((el) => el.classList.toggle("active", el.id === id));
+  document.querySelectorAll(".step").forEach((el) => el.classList.toggle("active", el.dataset.step === id));
+  if (id === "install") syncInstallInputs();
+  if (id === "finish") updateServerUrl();
+}
+function markDone(id) {
+  const el = document.querySelector(".step[data-step='" + id + "']");
+  if (el) el.classList.add("done");
+}
 async function login() {
   const res = await fetch("/api/v1/auth/login", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({username: username.value, password: password.value})});
   const data = await res.json();
   if (!res.ok) { loginStatus.textContent = data.message || "Login failed"; loginStatus.className = "error"; return; }
   token = data.token || data.access_token;
   localStorage.setItem("vortexoToken", token);
+  authPill.textContent = "Signed in";
+  authPill.className = "statusPill ok";
   loginStatus.textContent = "Signed in";
   loginStatus.className = "ok";
+  markDone("signin");
   loadManifests();
+  showStep("accounts");
 }
 async function loadManifests() {
   if (!token) return;
   const res = await fetch("/api/v1/bridge/manifests", {headers:{authorization:"Bearer " + token}});
+  if (res.status === 401 || res.status === 403) {
+    token = "";
+    localStorage.removeItem("vortexoToken");
+    authPill.textContent = "Signed out";
+    manifestList.textContent = "Sign in to view installed manifests.";
+    return;
+  }
   const data = await res.json();
   manifestList.innerHTML = "";
-  (data.manifests || []).forEach((item) => {
+  const items = data.manifests || [];
+  if (items.length === 0) {
+    manifestList.textContent = "No manifests installed yet.";
+    return;
+  }
+  items.forEach((item) => {
     const div = document.createElement("div");
     div.className = "row";
-    div.innerHTML = "<div><strong>" + escapeHtml(item.name || item.id) + "</strong><div class='muted'>" + escapeHtml(item.url) + "</div></div><button class='secondary' onclick='removeManifest(\"" + item.id + "\")'>Remove</button>";
+    div.innerHTML = "<div><strong>" + escapeHtml(item.name || item.id) + "</strong><div class='url'>" + escapeHtml(item.url) + "</div></div><button class='secondary' onclick='removeManifest(\"" + escapeAttr(item.id) + "\")'>Remove</button>";
     manifestList.appendChild(div);
   });
+  markDone("install");
 }
 async function addManifest() {
+  if (!token) { manifestStatus.textContent = "Sign in first."; manifestStatus.className = "error"; showStep("signin"); return; }
   manifestStatus.textContent = "Installing...";
   const res = await fetch("/api/v1/bridge/manifests", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({name: manifestName.value, url: manifestUrl.value, enabled: true})});
   const data = await res.json();
@@ -1203,14 +1449,93 @@ async function addManifest() {
   manifestName.value = "";
   loadManifests();
 }
+async function installSetup() {
+  if (!token) { manifestStatus.textContent = "Sign in first."; manifestStatus.className = "error"; showStep("signin"); return; }
+  syncDraftFromInstall();
+  const installs = [];
+  if (installCatalogUrl.value.trim()) installs.push({name:"AIOMetadata Catalogs", url: installCatalogUrl.value.trim(), enabled:true});
+  if (installStreamUrl.value.trim()) installs.push({name:"AIOStreams Sources", url: installStreamUrl.value.trim(), enabled:true});
+  if (installs.length === 0) { manifestStatus.textContent = "Paste at least one manifest URL."; manifestStatus.className = "error"; return; }
+  manifestStatus.textContent = "Installing " + installs.length + " manifest" + (installs.length === 1 ? "" : "s") + "...";
+  manifestStatus.className = "message muted";
+  for (const item of installs) {
+    const res = await fetch("/api/v1/bridge/manifests", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify(item)});
+    const data = await res.json();
+    if (!res.ok) { manifestStatus.textContent = data.message || "Install failed"; manifestStatus.className = "error"; return; }
+  }
+  manifestStatus.textContent = "Setup installed.";
+  manifestStatus.className = "ok";
+  markDone("catalogs");
+  markDone("streams");
+  markDone("install");
+  await loadManifests();
+  showStep("finish");
+}
 async function removeManifest(id) {
   await fetch("/api/v1/bridge/manifests/" + encodeURIComponent(id), {method:"DELETE", headers:{authorization:"Bearer " + token}});
   loadManifests();
 }
+function saveChecklist() {
+  const data = {};
+  document.querySelectorAll("[data-check]").forEach((el) => data[el.dataset.check] = el.checked);
+  localStorage.setItem("vortexoSetupChecklist", JSON.stringify(data));
+  accountStatus.textContent = "Checklist saved";
+  accountStatus.className = "message ok";
+  markDone("accounts");
+}
+function restoreChecklist() {
+  try {
+    const data = JSON.parse(localStorage.getItem("vortexoSetupChecklist") || "{}");
+    document.querySelectorAll("[data-check]").forEach((el) => el.checked = !!data[el.dataset.check]);
+  } catch {}
+}
+function saveDraft() {
+  localStorage.setItem("vortexoCatalogManifestUrl", catalogManifestUrl.value.trim());
+  localStorage.setItem("vortexoStreamManifestUrl", streamManifestUrl.value.trim());
+  if (catalogManifestUrl.value.trim()) markDone("catalogs");
+  if (streamManifestUrl.value.trim()) markDone("streams");
+}
+function restoreDraft() {
+  catalogManifestUrl.value = localStorage.getItem("vortexoCatalogManifestUrl") || "";
+  streamManifestUrl.value = localStorage.getItem("vortexoStreamManifestUrl") || "";
+  syncInstallInputs();
+}
+function syncInstallInputs() {
+  installCatalogUrl.value = catalogManifestUrl.value || localStorage.getItem("vortexoCatalogManifestUrl") || "";
+  installStreamUrl.value = streamManifestUrl.value || localStorage.getItem("vortexoStreamManifestUrl") || "";
+}
+function syncDraftFromInstall() {
+  catalogManifestUrl.value = installCatalogUrl.value.trim();
+  streamManifestUrl.value = installStreamUrl.value.trim();
+  saveDraft();
+}
+function updateServerUrl() {
+  serverUrl.textContent = window.location.origin;
+}
+async function copyServerUrl() {
+  try {
+    await navigator.clipboard.writeText(window.location.origin);
+    finishStatus.textContent = "Copied";
+    finishStatus.className = "message ok";
+  } catch {
+    finishStatus.textContent = window.location.origin;
+  }
+}
 function escapeHtml(value) {
   return String(value || "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
 }
-if (token) loadManifests();
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/\\/g, "\\\\");
+}
+restoreChecklist();
+restoreDraft();
+updateServerUrl();
+if (token) {
+  authPill.textContent = "Signed in";
+  authPill.className = "statusPill ok";
+  markDone("signin");
+  loadManifests();
+}
 </script>
 </body>
 </html>`
