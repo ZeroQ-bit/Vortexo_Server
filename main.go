@@ -1,0 +1,1220 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	defaultListenAddr = ":8080"
+	defaultUsername   = "vortexo"
+	defaultPassword   = "vortexo"
+)
+
+type appState struct {
+	mu       sync.RWMutex
+	dataDir  string
+	config   bridgeConfig
+	client   *http.Client
+	manifest map[string]manifestCacheEntry
+}
+
+type bridgeConfig struct {
+	AdminUsername string              `json:"admin_username"`
+	AdminPassword string              `json:"admin_password"`
+	AuthToken     string              `json:"auth_token"`
+	Manifests     []installedManifest `json:"manifests"`
+}
+
+type installedManifest struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	URL       string    `json:"url"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type manifestCacheEntry struct {
+	manifest stremioManifest
+	baseURL  string
+	expires  time.Time
+}
+
+type stremioManifest struct {
+	ID          string           `json:"id"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Resources   []any            `json:"resources"`
+	Types       []string         `json:"types"`
+	Catalogs    []stremioCatalog `json:"catalogs"`
+}
+
+type stremioCatalog struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type stremioCatalogResponse struct {
+	Metas []stremioMeta `json:"metas"`
+	Items []stremioMeta `json:"items"`
+}
+
+type stremioMeta struct {
+	ID            string   `json:"id"`
+	Type          string   `json:"type"`
+	Name          string   `json:"name"`
+	Title         string   `json:"title"`
+	Description   string   `json:"description"`
+	Poster        string   `json:"poster"`
+	PosterShape   string   `json:"posterShape"`
+	Background    string   `json:"background"`
+	Logo          string   `json:"logo"`
+	ReleaseInfo   string   `json:"releaseInfo"`
+	Year          any      `json:"year"`
+	Genres        []string `json:"genres"`
+	IMDBRating    string   `json:"imdbRating"`
+	Runtime       string   `json:"runtime"`
+	TMDBID        any      `json:"tmdb_id"`
+	IMDBID        string   `json:"imdb_id"`
+	OriginalTitle string   `json:"originalTitle"`
+	OriginalName  string   `json:"originalName"`
+	Released      string   `json:"released"`
+	FirstAired    string   `json:"firstAired"`
+	BehaviorHints any      `json:"behaviorHints"`
+	Videos        []any    `json:"videos"`
+}
+
+type stremioStreamResponse struct {
+	Streams []stremioStream `json:"streams"`
+}
+
+type stremioStream struct {
+	Name          string              `json:"name"`
+	Title         string              `json:"title"`
+	Description   string              `json:"description"`
+	URL           string              `json:"url"`
+	ExternalURL   string              `json:"externalUrl"`
+	InfoHash      string              `json:"infoHash"`
+	FileIdx       int                 `json:"fileIdx"`
+	BehaviorHints streamBehaviorHints `json:"behaviorHints"`
+}
+
+type streamBehaviorHints struct {
+	Filename  string            `json:"filename"`
+	VideoSize int64             `json:"videoSize"`
+	Headers   map[string]string `json:"proxyHeaders"`
+}
+
+type vortexoHomeFeed struct {
+	GeneratedAt  time.Time        `json:"generated_at"`
+	RefreshAfter time.Time        `json:"refresh_after"`
+	Rows         []vortexoHomeRow `json:"rows"`
+}
+
+type vortexoHomeRow struct {
+	ID           string            `json:"id"`
+	Title        string            `json:"title"`
+	Reason       string            `json:"reason,omitempty"`
+	RefreshAfter time.Time         `json:"refresh_after"`
+	Items        []vortexoHomeItem `json:"items"`
+}
+
+type vortexoHomeItem struct {
+	ID               string   `json:"id"`
+	RatingKey        string   `json:"rating_key,omitempty"`
+	Key              string   `json:"key,omitempty"`
+	GUID             string   `json:"guid,omitempty"`
+	MediaType        string   `json:"media_type"`
+	TMDBID           int      `json:"tmdb_id,omitempty"`
+	IMDBID           string   `json:"imdb_id,omitempty"`
+	Title            string   `json:"title"`
+	OriginalTitle    string   `json:"original_title,omitempty"`
+	Overview         string   `json:"overview,omitempty"`
+	PosterPath       string   `json:"poster_path,omitempty"`
+	BackdropPath     string   `json:"backdrop_path,omitempty"`
+	LandscapePath    string   `json:"landscape_path,omitempty"`
+	LogoPath         string   `json:"logo_path,omitempty"`
+	OriginalLanguage string   `json:"original_language,omitempty"`
+	Keywords         []string `json:"keywords,omitempty"`
+	Year             int      `json:"year,omitempty"`
+	Runtime          int      `json:"runtime,omitempty"`
+	Genres           []string `json:"genres,omitempty"`
+	VoteAverage      float64  `json:"vote_average,omitempty"`
+	ReleaseDate      string   `json:"release_date,omitempty"`
+	FirstAirDate     string   `json:"first_air_date,omitempty"`
+	AddedAt          int64    `json:"added_at,omitempty"`
+	UpdatedAt        int64    `json:"updated_at,omitempty"`
+}
+
+type vortexoSourcesRequest struct {
+	Type        string `json:"type"`
+	Title       string `json:"title"`
+	Year        int    `json:"year,omitempty"`
+	TMDBID      int    `json:"tmdb_id,omitempty"`
+	IMDBID      string `json:"imdb_id,omitempty"`
+	Season      int    `json:"season,omitempty"`
+	Episode     int    `json:"episode,omitempty"`
+	ParentTitle string `json:"parent_title,omitempty"`
+}
+
+type vortexoSourcesResponse struct {
+	Matched   bool            `json:"matched"`
+	Available bool            `json:"available"`
+	Sources   []vortexoSource `json:"sources"`
+}
+
+type vortexoSource struct {
+	ID           string  `json:"id"`
+	Label        string  `json:"label"`
+	Title        string  `json:"title,omitempty"`
+	Quality      string  `json:"quality,omitempty"`
+	Cached       bool    `json:"cached"`
+	HDR          bool    `json:"hdr"`
+	DynamicRange string  `json:"dynamic_range,omitempty"`
+	Codec        string  `json:"codec,omitempty"`
+	Audio        string  `json:"audio,omitempty"`
+	Source       string  `json:"source,omitempty"`
+	SizeGB       float64 `json:"size_gb,omitempty"`
+	FileName     string  `json:"file_name,omitempty"`
+	Season       int     `json:"season,omitempty"`
+	Episode      int     `json:"episode,omitempty"`
+	Priority     int     `json:"priority,omitempty"`
+	PlayURL      string  `json:"play_url"`
+}
+
+type playToken struct {
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Title   string            `json:"title,omitempty"`
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	dataDir := firstNonEmpty(os.Getenv("VORTEXO_DATA_DIR"), os.Getenv("DATA_DIR"), "/data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+
+	state := &appState{
+		dataDir:  dataDir,
+		client:   &http.Client{Timeout: 20 * time.Second},
+		manifest: map[string]manifestCacheEntry{},
+	}
+	if err := state.load(); err != nil {
+		return err
+	}
+
+	mux := http.NewServeMux()
+	state.registerRoutes(mux)
+
+	addr := firstNonEmpty(os.Getenv("VORTEXO_LISTEN_ADDR"), os.Getenv("PORT"), defaultListenAddr)
+	if !strings.HasPrefix(addr, ":") && !strings.Contains(addr, ":") {
+		addr = ":" + addr
+	}
+	log.Printf("Vortexo Manifest Server listening on %s", addr)
+	return http.ListenAndServe(addr, state.withCORS(mux))
+}
+
+func (s *appState) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/v1/health", s.handleHealth)
+	mux.HandleFunc("/api/v1/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
+	mux.HandleFunc("/api/v1/auth/verify", s.requireAuth(s.handleVerify))
+	mux.HandleFunc("/api/v1/settings", s.handleSettings)
+	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
+	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
+	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
+	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
+	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
+	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
+}
+
+func (s *appState) load() error {
+	path := filepath.Join(s.dataDir, "config.json")
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &s.config); err != nil {
+			return err
+		}
+	}
+
+	changed := false
+	if s.config.AdminUsername == "" {
+		s.config.AdminUsername = firstNonEmpty(os.Getenv("VORTEXO_ADMIN_USERNAME"), defaultUsername)
+		changed = true
+	}
+	if s.config.AdminPassword == "" {
+		s.config.AdminPassword = firstNonEmpty(os.Getenv("VORTEXO_ADMIN_PASSWORD"), defaultPassword)
+		changed = true
+	}
+	if s.config.AuthToken == "" {
+		s.config.AuthToken = randomToken()
+		changed = true
+	}
+	if s.config.Manifests == nil {
+		s.config.Manifests = []installedManifest{}
+		changed = true
+	}
+	if changed {
+		return s.saveLocked()
+	}
+	return nil
+}
+
+func (s *appState) saveLocked() error {
+	data, err := json.MarshalIndent(s.config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(s.dataDir, "config.json"), data, 0o600)
+}
+
+func (s *appState) withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *appState) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authorized(r) {
+			respondError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *appState) authorized(r *http.Request) bool {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		token := strings.TrimSpace(auth[7:])
+		s.mu.RLock()
+		ok := token != "" && token == s.config.AuthToken
+		s.mu.RUnlock()
+		return ok
+	}
+	user, pass, ok := r.BasicAuth()
+	if ok {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return user == s.config.AdminUsername && pass == s.config.AdminPassword
+	}
+	return false
+}
+
+func (s *appState) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, indexHTML)
+}
+
+func (s *appState) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true, "name": "Vortexo Manifest Server"})
+}
+
+func (s *appState) handleAuthStatus(w http.ResponseWriter, _ *http.Request) {
+	s.mu.RLock()
+	count := 0
+	if s.config.AdminUsername != "" {
+		count = 1
+	}
+	s.mu.RUnlock()
+	respondJSON(w, http.StatusOK, map[string]any{"setupRequired": false, "userCount": count})
+}
+
+func (s *appState) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	s.mu.RLock()
+	ok := req.Username == s.config.AdminUsername && req.Password == s.config.AdminPassword
+	token := s.config.AuthToken
+	s.mu.RUnlock()
+	if !ok {
+		respondError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"token": token, "access_token": token})
+}
+
+func (s *appState) handleVerify(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *appState) handleSettings(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]any{
+		"opensubtitles_languages": "en",
+		"manifest_bridge":         true,
+	})
+}
+
+func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]any{
+		"name":                 "Vortexo Manifest Bridge",
+		"home":                 true,
+		"source_api":           true,
+		"playback":             true,
+		"manifest_bridge":      true,
+		"requires_app_changes": false,
+		"types":                []string{"movie", "episode"},
+	})
+}
+
+func (s *appState) handleManifests(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		items := append([]installedManifest(nil), s.config.Manifests...)
+		s.mu.RUnlock()
+		if items == nil {
+			items = []installedManifest{}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"manifests": items})
+	case http.MethodPost:
+		var req installedManifest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		req.URL = normalizeManifestURL(req.URL)
+		if req.URL == "" {
+			respondError(w, http.StatusBadRequest, "manifest URL is required")
+			return
+		}
+		manifest, _, err := s.fetchManifest(r.Context(), req.URL, true)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, "manifest validation failed: "+err.Error())
+			return
+		}
+		now := time.Now().UTC()
+		if req.ID == "" {
+			req.ID = slug(firstNonEmpty(req.Name, manifest.Name, req.URL))
+		}
+		if req.Name == "" {
+			req.Name = firstNonEmpty(manifest.Name, req.ID)
+		}
+		req.Enabled = true
+		req.CreatedAt = now
+		req.UpdatedAt = now
+
+		s.mu.Lock()
+		replaced := false
+		for i := range s.config.Manifests {
+			if s.config.Manifests[i].ID == req.ID || strings.EqualFold(s.config.Manifests[i].URL, req.URL) {
+				req.CreatedAt = s.config.Manifests[i].CreatedAt
+				s.config.Manifests[i] = req
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			s.config.Manifests = append(s.config.Manifests, req)
+		}
+		err = s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save manifest")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"manifest": req})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handleManifestByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/bridge/manifests/")
+	id = strings.Trim(id, "/")
+	if id == "" {
+		respondError(w, http.StatusBadRequest, "missing manifest id")
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		s.mu.Lock()
+		next := s.config.Manifests[:0]
+		found := false
+		for _, item := range s.config.Manifests {
+			if item.ID == id {
+				found = true
+				continue
+			}
+			next = append(next, item)
+		}
+		s.config.Manifests = next
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save manifest")
+			return
+		}
+		if !found {
+			respondError(w, http.StatusNotFound, "manifest not found")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
+	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), 8, 1, 12)
+	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
+
+	installed := s.enabledManifests()
+	rows := make([]vortexoHomeRow, 0, rowLimit)
+	used := map[string]bool{}
+	now := time.Now().UTC()
+
+	for _, item := range installed {
+		if len(rows) >= rowLimit {
+			break
+		}
+		manifest, base, err := s.fetchManifest(r.Context(), item.URL, false)
+		if err != nil {
+			log.Printf("home manifest %s failed: %v", item.URL, err)
+			continue
+		}
+		for _, catalog := range manifest.Catalogs {
+			if len(rows) >= rowLimit {
+				break
+			}
+			mediaType := normalizeCatalogType(catalog.Type)
+			if mediaType == "" {
+				continue
+			}
+			items, err := s.fetchCatalog(r.Context(), base, catalog, itemLimit*2)
+			if err != nil {
+				log.Printf("catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
+				continue
+			}
+			rowItems := make([]vortexoHomeItem, 0, itemLimit)
+			for _, meta := range items {
+				homeItem := homeItemFromStremio(meta, mediaType)
+				key := homeDedupeKey(homeItem)
+				if key == "" || used[key] {
+					continue
+				}
+				used[key] = true
+				rowItems = append(rowItems, homeItem)
+				if len(rowItems) >= itemLimit {
+					break
+				}
+			}
+			if len(rowItems) == 0 {
+				continue
+			}
+			title := firstNonEmpty(catalog.Name, item.Name, manifest.Name, "Recommended")
+			rows = append(rows, vortexoHomeRow{
+				ID:           slug(item.ID + "-" + catalog.Type + "-" + catalog.ID),
+				Title:        title,
+				Reason:       "Installed manifest catalog",
+				RefreshAfter: now.Add(time.Hour),
+				Items:        rowItems,
+			})
+		}
+	}
+
+	respondJSON(w, http.StatusOK, vortexoHomeFeed{
+		GeneratedAt:  now,
+		RefreshAfter: now.Add(time.Hour),
+		Rows:         rows,
+	})
+}
+
+func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req vortexoSourcesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Type = normalizeVortexoType(req.Type)
+	if req.Type == "" {
+		respondError(w, http.StatusBadRequest, "type must be movie or episode")
+		return
+	}
+	imdbID := strings.TrimSpace(req.IMDBID)
+	if imdbID == "" {
+		respondJSON(w, http.StatusOK, vortexoSourcesResponse{Matched: false, Available: false, Sources: []vortexoSource{}})
+		return
+	}
+
+	var all []vortexoSource
+	seen := map[string]bool{}
+	for _, item := range s.enabledManifests() {
+		manifest, base, err := s.fetchManifest(r.Context(), item.URL, false)
+		if err != nil || !manifestSupportsResource(manifest, "stream") {
+			continue
+		}
+		streams, err := s.fetchStreams(r.Context(), base, req, imdbID)
+		if err != nil {
+			log.Printf("streams %s failed: %v", item.URL, err)
+			continue
+		}
+		for _, stream := range streams {
+			source, ok := vortexoSourceFromStream(stream, item.Name, req)
+			if !ok {
+				continue
+			}
+			key := firstNonEmpty(stream.URL, stream.ExternalURL, stream.InfoHash, source.FileName, source.Title)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			all = append(all, source)
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].Cached != all[j].Cached {
+			return all[i].Cached
+		}
+		return all[i].SizeGB > all[j].SizeGB
+	})
+	respondJSON(w, http.StatusOK, vortexoSourcesResponse{Matched: true, Available: len(all) > 0, Sources: all})
+}
+
+func (s *appState) handleVortexoPlay(w http.ResponseWriter, r *http.Request) {
+	tokenValue := strings.TrimPrefix(r.URL.Path, "/api/v1/vortexo/play/")
+	tokenValue = strings.Trim(tokenValue, "/")
+	var token playToken
+	data, err := base64.RawURLEncoding.DecodeString(tokenValue)
+	if err != nil || json.Unmarshal(data, &token) != nil || token.URL == "" {
+		respondError(w, http.StatusBadRequest, "invalid source token")
+		return
+	}
+	if wantsJSON(r) {
+		respondJSON(w, http.StatusOK, map[string]any{
+			"url":          token.URL,
+			"stream_url":   token.URL,
+			"direct_url":   token.URL,
+			"download_url": token.URL,
+		})
+		return
+	}
+	http.Redirect(w, r, token.URL, http.StatusFound)
+}
+
+func (s *appState) enabledManifests() []installedManifest {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []installedManifest
+	for _, item := range s.config.Manifests {
+		if item.Enabled && strings.TrimSpace(item.URL) != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (s *appState) fetchManifest(ctx context.Context, rawURL string, force bool) (stremioManifest, string, error) {
+	rawURL = normalizeManifestURL(rawURL)
+	if rawURL == "" {
+		return stremioManifest{}, "", fmt.Errorf("empty manifest URL")
+	}
+	now := time.Now()
+	s.mu.RLock()
+	cached, ok := s.manifest[rawURL]
+	s.mu.RUnlock()
+	if ok && !force && now.Before(cached.expires) {
+		return cached.manifest, cached.baseURL, nil
+	}
+
+	var manifest stremioManifest
+	if err := s.getJSON(ctx, rawURL, &manifest); err != nil {
+		return manifest, "", err
+	}
+	if manifest.Name == "" && manifest.ID == "" {
+		return manifest, "", fmt.Errorf("not a Stremio manifest")
+	}
+	base := strings.TrimSuffix(rawURL, "/manifest.json")
+	base = strings.TrimRight(base, "/")
+	s.mu.Lock()
+	s.manifest[rawURL] = manifestCacheEntry{manifest: manifest, baseURL: base, expires: now.Add(10 * time.Minute)}
+	s.mu.Unlock()
+	return manifest, base, nil
+}
+
+func (s *appState) fetchCatalog(ctx context.Context, base string, catalog stremioCatalog, limit int) ([]stremioMeta, error) {
+	u := fmt.Sprintf("%s/catalog/%s/%s.json", strings.TrimRight(base, "/"), url.PathEscape(catalog.Type), url.PathEscape(catalog.ID))
+	var response stremioCatalogResponse
+	if err := s.getJSON(ctx, u, &response); err != nil {
+		return nil, err
+	}
+	items := response.Metas
+	if len(items) == 0 {
+		items = response.Items
+	}
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
+func (s *appState) fetchStreams(ctx context.Context, base string, req vortexoSourcesRequest, imdbID string) ([]stremioStream, error) {
+	var path string
+	if req.Type == "episode" {
+		if req.Season <= 0 || req.Episode <= 0 {
+			return nil, fmt.Errorf("season and episode are required")
+		}
+		path = fmt.Sprintf("stream/series/%s:%d:%d.json", url.PathEscape(imdbID), req.Season, req.Episode)
+	} else {
+		path = fmt.Sprintf("stream/movie/%s.json", url.PathEscape(imdbID))
+	}
+	u := strings.TrimRight(base, "/") + "/" + path
+	var response stremioStreamResponse
+	if err := s.getJSON(ctx, u, &response); err != nil {
+		return nil, err
+	}
+	return response.Streams, nil
+}
+
+func (s *appState) getJSON(ctx context.Context, rawURL string, target any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "VortexoManifestBridge/1.0")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		mediaType, _, _ := mime.ParseMediaType(ct)
+		if mediaType != "" && !strings.Contains(mediaType, "json") && mediaType != "text/plain" {
+			log.Printf("warning: %s returned content-type %s", rawURL, ct)
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, target)
+}
+
+func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem {
+	mediaType := normalizeCatalogType(firstNonEmpty(meta.Type, fallbackType))
+	title := firstNonEmpty(meta.Name, meta.Title, "Untitled")
+	imdbID := firstNonEmpty(meta.IMDBID, imdbFromID(meta.ID))
+	tmdbID := intFromAny(meta.TMDBID)
+	year := intFromAny(meta.Year)
+	if year == 0 {
+		year = yearFromText(firstNonEmpty(meta.ReleaseInfo, meta.Released, meta.FirstAired))
+	}
+	vote := floatFromText(meta.IMDBRating)
+	releaseDate := dateFromText(firstNonEmpty(meta.Released, meta.ReleaseInfo))
+	firstAirDate := ""
+	if mediaType == "tv" {
+		firstAirDate = dateFromText(firstNonEmpty(meta.FirstAired, meta.ReleaseInfo))
+	}
+	id := firstNonEmpty(meta.ID, imdbID, slug(title+"-"+strconv.Itoa(year)))
+	guid := ""
+	if tmdbID > 0 {
+		guid = "tmdb://" + mediaType + "/" + strconv.Itoa(tmdbID)
+	} else if imdbID != "" {
+		guid = "imdb://" + imdbID
+	}
+	return vortexoHomeItem{
+		ID:            id,
+		RatingKey:     "vortexo:manifest:" + mediaType + ":" + id,
+		Key:           guid,
+		GUID:          guid,
+		MediaType:     mediaType,
+		TMDBID:        tmdbID,
+		IMDBID:        imdbID,
+		Title:         title,
+		OriginalTitle: firstNonEmpty(meta.OriginalTitle, meta.OriginalName),
+		Overview:      meta.Description,
+		PosterPath:    meta.Poster,
+		BackdropPath:  meta.Background,
+		LandscapePath: meta.Background,
+		LogoPath:      meta.Logo,
+		Year:          year,
+		Runtime:       runtimeMinutes(meta.Runtime),
+		Genres:        meta.Genres,
+		VoteAverage:   vote,
+		ReleaseDate:   releaseDate,
+		FirstAirDate:  firstAirDate,
+		AddedAt:       time.Now().Unix(),
+		UpdatedAt:     time.Now().Unix(),
+	}
+}
+
+func vortexoSourceFromStream(stream stremioStream, manifestName string, req vortexoSourcesRequest) (vortexoSource, bool) {
+	playURL := firstNonEmpty(stream.URL, stream.ExternalURL)
+	if playURL == "" {
+		return vortexoSource{}, false
+	}
+	filename := firstNonEmpty(stream.BehaviorHints.Filename, stream.Title, stream.Name, req.Title)
+	quality := extractQuality(filename + " " + stream.Name + " " + stream.Description)
+	codec := extractCodec(filename + " " + stream.Name + " " + stream.Description)
+	audio := extractAudio(filename + " " + stream.Name + " " + stream.Description)
+	dynamicRange := extractDynamicRange(filename + " " + stream.Name + " " + stream.Description)
+	sizeGB := float64(stream.BehaviorHints.VideoSize) / (1024 * 1024 * 1024)
+	if sizeGB == 0 {
+		sizeGB = parseSizeGB(filename + " " + stream.Description + " " + stream.Title)
+	}
+	tokenData, _ := json.Marshal(playToken{URL: playURL, Headers: stream.BehaviorHints.Headers, Title: filename})
+	id := base64.RawURLEncoding.EncodeToString(tokenData)
+	labelBits := []string{}
+	for _, bit := range []string{quality, dynamicRange, codec, audio} {
+		if strings.TrimSpace(bit) != "" {
+			labelBits = append(labelBits, bit)
+		}
+	}
+	if len(labelBits) == 0 {
+		labelBits = append(labelBits, "Stream")
+	}
+	source := vortexoSource{
+		ID:           id,
+		Label:        strings.Join(labelBits, " • "),
+		Title:        firstNonEmpty(stream.Name, manifestName),
+		Quality:      quality,
+		Cached:       looksCached(stream),
+		HDR:          dynamicRange != "" && dynamicRange != "SDR",
+		DynamicRange: dynamicRange,
+		Codec:        codec,
+		Audio:        audio,
+		Source:       "Vortexo Server",
+		SizeGB:       sizeGB,
+		FileName:     filename,
+		Priority:     0,
+		PlayURL:      "/api/v1/vortexo/play/" + id,
+	}
+	if req.Type == "episode" {
+		source.Season = req.Season
+		source.Episode = req.Episode
+	}
+	return source, true
+}
+
+func manifestSupportsResource(manifest stremioManifest, wanted string) bool {
+	if len(manifest.Resources) == 0 {
+		return true
+	}
+	for _, raw := range manifest.Resources {
+		switch value := raw.(type) {
+		case string:
+			if strings.EqualFold(value, wanted) {
+				return true
+			}
+		case map[string]any:
+			if strings.EqualFold(fmt.Sprint(value["name"]), wanted) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeManifestURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(raw), "stremio://") {
+		raw = "https://" + raw[len("stremio://"):]
+	}
+	raw = strings.TrimRight(raw, "/")
+	if !strings.HasPrefix(strings.ToLower(raw), "http://") && !strings.HasPrefix(strings.ToLower(raw), "https://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	if !strings.HasSuffix(strings.ToLower(strings.TrimRight(parsed.Path, "/")), "/manifest.json") {
+		parsed.Path = strings.TrimRight(parsed.Path, "/") + "/manifest.json"
+	}
+	return parsed.String()
+}
+
+func normalizeCatalogType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "movie", "movies":
+		return "movie"
+	case "series", "tv", "show", "shows":
+		return "tv"
+	default:
+		return ""
+	}
+}
+
+func normalizeVortexoType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "movie":
+		return "movie"
+	case "episode", "series", "show", "tv":
+		return "episode"
+	default:
+		return ""
+	}
+}
+
+func homeDedupeKey(item vortexoHomeItem) string {
+	if item.TMDBID > 0 {
+		return item.MediaType + ":tmdb:" + strconv.Itoa(item.TMDBID)
+	}
+	if item.IMDBID != "" {
+		return item.MediaType + ":imdb:" + strings.ToLower(item.IMDBID)
+	}
+	return item.MediaType + ":" + slug(item.Title+"-"+strconv.Itoa(item.Year))
+}
+
+func randomToken() string {
+	var data [32]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:])
+}
+
+func respondJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func respondError(w http.ResponseWriter, status int, message string) {
+	respondJSON(w, status, map[string]any{"error": message, "message": message})
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func boundedInt(raw string, fallback, min, max int) int {
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		value = fallback
+	}
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func wantsJSON(r *http.Request) bool {
+	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if q == "json" || q == "direct" || q == "url" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
+}
+
+func slug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var out strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if ok {
+			out.WriteRune(r)
+			lastDash = false
+		} else if !lastDash {
+			out.WriteRune('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(out.String(), "-")
+}
+
+func imdbFromID(value string) string {
+	re := regexp.MustCompile(`tt\d{5,}`)
+	return re.FindString(value)
+}
+
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return n
+	default:
+		return 0
+	}
+}
+
+func floatFromText(value string) float64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	f, _ := strconv.ParseFloat(value, 64)
+	return f
+}
+
+func yearFromText(value string) int {
+	re := regexp.MustCompile(`(19|20)\d{2}`)
+	n, _ := strconv.Atoi(re.FindString(value))
+	return n
+}
+
+func dateFromText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if len(value) >= 10 && value[4:5] == "-" {
+		return value[:10]
+	}
+	if year := yearFromText(value); year > 0 {
+		return fmt.Sprintf("%04d-01-01", year)
+	}
+	return ""
+}
+
+func runtimeMinutes(value string) int {
+	re := regexp.MustCompile(`\d+`)
+	n, _ := strconv.Atoi(re.FindString(value))
+	return n
+}
+
+func extractQuality(value string) string {
+	lower := strings.ToLower(value)
+	for _, q := range []string{"2160p", "4k", "1080p", "720p", "576p", "480p"} {
+		if strings.Contains(lower, q) {
+			if q == "4k" {
+				return "2160p"
+			}
+			return q
+		}
+	}
+	return ""
+}
+
+func extractCodec(value string) string {
+	lower := strings.ToLower(value)
+	for _, c := range []string{"av1", "hevc", "x265", "h265", "h.265", "x264", "h264", "h.264"} {
+		if strings.Contains(lower, c) {
+			switch c {
+			case "x265", "h265", "h.265":
+				return "HEVC"
+			case "x264", "h264", "h.264":
+				return "H264"
+			default:
+				return strings.ToUpper(c)
+			}
+		}
+	}
+	return ""
+}
+
+func extractAudio(value string) string {
+	lower := strings.ToLower(value)
+	for _, a := range []string{"truehd", "atmos", "dts-hd", "eac3", "ddp", "ac3", "aac"} {
+		if strings.Contains(lower, a) {
+			return strings.ToUpper(a)
+		}
+	}
+	return ""
+}
+
+func extractDynamicRange(value string) string {
+	lower := strings.ToLower(value)
+	switch {
+	case strings.Contains(lower, "dolby vision"), strings.Contains(lower, " dovi"), strings.Contains(lower, ".dovi"):
+		return "DV"
+	case strings.Contains(lower, "hdr10+"):
+		return "HDR10+"
+	case strings.Contains(lower, "hdr"):
+		return "HDR"
+	default:
+		return ""
+	}
+}
+
+func parseSizeGB(value string) float64 {
+	re := regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(gb|mb)`)
+	match := re.FindStringSubmatch(value)
+	if len(match) != 3 {
+		return 0
+	}
+	n, _ := strconv.ParseFloat(match[1], 64)
+	if strings.EqualFold(match[2], "mb") {
+		return n / 1024
+	}
+	return n
+}
+
+func looksCached(stream stremioStream) bool {
+	value := strings.ToLower(stream.Name + " " + stream.Title + " " + stream.Description)
+	return strings.Contains(value, "rd+") ||
+		strings.Contains(value, "cached") ||
+		strings.Contains(value, "instant") ||
+		strings.Contains(value, "⚡")
+}
+
+const indexHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vortexo Manifest Server</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #08090b; color: #f5f7fb; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 20% 0%, #18324a 0, #08090b 35rem); }
+    main { max-width: 980px; margin: 0 auto; padding: 48px 24px; }
+    h1 { font-size: 40px; margin: 0 0 8px; }
+    p { color: #b8c1ce; line-height: 1.55; }
+    .panel { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.12); border-radius: 12px; padding: 20px; margin: 18px 0; }
+    label { display: block; margin: 12px 0 6px; color: #d9e0ea; }
+    input { width: 100%; box-sizing: border-box; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(0,0,0,.35); color: white; padding: 12px; font-size: 16px; }
+    button { border: 0; border-radius: 8px; background: #2997ff; color: white; padding: 11px 15px; font-weight: 700; cursor: pointer; margin-top: 12px; }
+    button.secondary { background: rgba(255,255,255,.12); }
+    code { color: #9cdcfe; }
+    .row { display: flex; align-items: center; gap: 12px; justify-content: space-between; padding: 12px 0; border-top: 1px solid rgba(255,255,255,.1); }
+    .muted { color: #8b96a7; font-size: 14px; }
+    .ok { color: #7ee787; }
+    .error { color: #ff8a8a; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Vortexo Manifest Server</h1>
+  <p>A clean Vortexo backend for Apple TV. Install Stremio-compatible manifests here, then connect the Vortexo app with this server URL, username, and password.</p>
+  <div class="panel">
+    <h2>1. Sign In</h2>
+    <p>Default Umbrel credentials are <code>vortexo</code> / <code>vortexo</code> unless changed by environment variables.</p>
+    <label>Username</label><input id="username" value="vortexo" autocomplete="username">
+    <label>Password</label><input id="password" type="password" value="vortexo" autocomplete="current-password">
+    <button onclick="login()">Sign In</button>
+    <span id="loginStatus" class="muted"></span>
+  </div>
+  <div class="panel">
+    <h2>2. Install Manifests</h2>
+    <p>Install an AIOMetadata manifest for Home rows and an AIOStreams manifest for source lookup. The Apple TV app reads only Vortexo's existing API.</p>
+    <label>Manifest URL</label><input id="manifestUrl" placeholder="https://example.com/your-config/manifest.json">
+    <label>Name</label><input id="manifestName" placeholder="AIOStreams or AIOMetadata">
+    <button onclick="addManifest()">Install Manifest</button>
+    <button class="secondary" onclick="loadManifests()">Refresh</button>
+    <p id="manifestStatus" class="muted"></p>
+    <div id="manifestList"></div>
+  </div>
+  <div class="panel">
+    <h2>3. Connect Apple TV</h2>
+    <p>In Vortexo Apple TV settings, enable Vortexo Server and use this Umbrel app URL. The app will call <code>/api/v1/vortexo/home</code> and <code>/api/v1/vortexo/sources</code>.</p>
+  </div>
+</main>
+<script>
+let token = localStorage.getItem("vortexoToken") || "";
+async function login() {
+  const res = await fetch("/api/v1/auth/login", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({username: username.value, password: password.value})});
+  const data = await res.json();
+  if (!res.ok) { loginStatus.textContent = data.message || "Login failed"; loginStatus.className = "error"; return; }
+  token = data.token || data.access_token;
+  localStorage.setItem("vortexoToken", token);
+  loginStatus.textContent = "Signed in";
+  loginStatus.className = "ok";
+  loadManifests();
+}
+async function loadManifests() {
+  if (!token) return;
+  const res = await fetch("/api/v1/bridge/manifests", {headers:{authorization:"Bearer " + token}});
+  const data = await res.json();
+  manifestList.innerHTML = "";
+  (data.manifests || []).forEach((item) => {
+    const div = document.createElement("div");
+    div.className = "row";
+    div.innerHTML = "<div><strong>" + escapeHtml(item.name || item.id) + "</strong><div class='muted'>" + escapeHtml(item.url) + "</div></div><button class='secondary' onclick='removeManifest(\"" + item.id + "\")'>Remove</button>";
+    manifestList.appendChild(div);
+  });
+}
+async function addManifest() {
+  manifestStatus.textContent = "Installing...";
+  const res = await fetch("/api/v1/bridge/manifests", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify({name: manifestName.value, url: manifestUrl.value, enabled: true})});
+  const data = await res.json();
+  if (!res.ok) { manifestStatus.textContent = data.message || "Install failed"; manifestStatus.className = "error"; return; }
+  manifestStatus.textContent = "Installed";
+  manifestStatus.className = "ok";
+  manifestUrl.value = "";
+  manifestName.value = "";
+  loadManifests();
+}
+async function removeManifest(id) {
+  await fetch("/api/v1/bridge/manifests/" + encodeURIComponent(id), {method:"DELETE", headers:{authorization:"Bearer " + token}});
+  loadManifests();
+}
+function escapeHtml(value) {
+  return String(value || "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
+}
+if (token) loadManifests();
+</script>
+</body>
+</html>`
+
+func _htmlEscape(value string) string {
+	return html.EscapeString(value)
+}
