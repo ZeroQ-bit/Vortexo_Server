@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -51,6 +52,62 @@ type installedManifest struct {
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type perfectSetupRequest struct {
+	Install         bool                    `json:"install"`
+	ReplaceExisting bool                    `json:"replace_existing"`
+	Password        string                  `json:"password"`
+	AIOMetadata     aiometadataSetupRequest `json:"aiometadata"`
+	AIOStreams      aiostreamsSetupRequest  `json:"aiostreams"`
+}
+
+type aiometadataSetupRequest struct {
+	Enabled         bool     `json:"enabled"`
+	Instance        string   `json:"instance"`
+	Instances       []string `json:"instances"`
+	Language        string   `json:"language"`
+	TMDBAPIKey      string   `json:"tmdb_api_key"`
+	TMDBAccessToken string   `json:"tmdb_access_token"`
+	TVDBAPIKey      string   `json:"tvdb_api_key"`
+	GeminiAPIKey    string   `json:"gemini_api_key"`
+	RPDBAPIKey      string   `json:"rpdb_api_key"`
+	IncludeAdult    bool     `json:"include_adult"`
+}
+
+type aiostreamsSetupRequest struct {
+	Enabled         bool     `json:"enabled"`
+	Instance        string   `json:"instance"`
+	Instances       []string `json:"instances"`
+	DebridProvider  string   `json:"debrid_provider"`
+	DebridAPIKey    string   `json:"debrid_api_key"`
+	TMDBAPIKey      string   `json:"tmdb_api_key"`
+	TMDBAccessToken string   `json:"tmdb_access_token"`
+	TVDBAPIKey      string   `json:"tvdb_api_key"`
+	RPDBAPIKey      string   `json:"rpdb_api_key"`
+	Languages       []string `json:"languages"`
+	TimeoutMS       int      `json:"timeout_ms"`
+	IncludeP2P      bool     `json:"include_p2p"`
+}
+
+type perfectSetupResponse struct {
+	OK          bool                   `json:"ok"`
+	Generated   []generatedManifest    `json:"generated"`
+	Installed   []installedManifest    `json:"installed"`
+	Warnings    []string               `json:"warnings,omitempty"`
+	Credentials perfectSetupCredential `json:"credentials"`
+}
+
+type generatedManifest struct {
+	Kind        string `json:"kind"`
+	Name        string `json:"name"`
+	Instance    string `json:"instance"`
+	ManifestURL string `json:"manifest_url"`
+	UUID        string `json:"uuid,omitempty"`
+}
+
+type perfectSetupCredential struct {
+	Password string `json:"password"`
 }
 
 type manifestCacheEntry struct {
@@ -247,6 +304,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/v1/auth/verify", s.requireAuth(s.handleVerify))
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
+	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
@@ -409,6 +467,80 @@ func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *appState) handlePerfectSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req perfectSetupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !req.AIOMetadata.Enabled && !req.AIOStreams.Enabled {
+		req.AIOMetadata.Enabled = true
+		req.AIOStreams.Enabled = true
+	}
+	if req.Password == "" {
+		req.Password = randomSetupPassword()
+	}
+	install := req.Install
+	if !req.Install {
+		install = true
+	}
+
+	var generated []generatedManifest
+	var warnings []string
+	if req.AIOMetadata.Enabled {
+		result, tried, err := s.createAIOMetadataSetup(r.Context(), req.AIOMetadata, req.Password)
+		warnings = append(warnings, tried...)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, "AIOMetadata setup failed: "+err.Error()+" "+strings.Join(tried, " "))
+			return
+		}
+		generated = append(generated, result)
+	}
+	if req.AIOStreams.Enabled {
+		result, tried, err := s.createAIOStreamsSetup(r.Context(), req.AIOStreams, req.Password)
+		warnings = append(warnings, tried...)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, "AIOStreams setup failed: "+err.Error()+" "+strings.Join(tried, " "))
+			return
+		}
+		generated = append(generated, result)
+	}
+
+	var installed []installedManifest
+	if install {
+		if req.ReplaceExisting {
+			s.removeGeneratedManifests()
+		}
+		for _, item := range generated {
+			manifest, err := s.installManifest(r.Context(), installedManifest{
+				ID:      "vortexo-" + item.Kind,
+				Name:    item.Name,
+				URL:     item.ManifestURL,
+				Enabled: true,
+			})
+			if err != nil {
+				respondError(w, http.StatusBadGateway, "generated manifest install failed: "+err.Error())
+				return
+			}
+			installed = append(installed, manifest)
+		}
+	}
+
+	respondJSON(w, http.StatusOK, perfectSetupResponse{
+		OK:        true,
+		Generated: generated,
+		Installed: installed,
+		Warnings:  warnings,
+		Credentials: perfectSetupCredential{
+			Password: req.Password,
+		},
+	})
+}
+
 func (s *appState) handleManifests(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -425,47 +557,12 @@ func (s *appState) handleManifests(w http.ResponseWriter, r *http.Request) {
 			respondError(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
-		req.URL = normalizeManifestURL(req.URL)
-		if req.URL == "" {
-			respondError(w, http.StatusBadRequest, "manifest URL is required")
-			return
-		}
-		manifest, _, err := s.fetchManifest(r.Context(), req.URL, true)
+		manifest, err := s.installManifest(r.Context(), req)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, "manifest validation failed: "+err.Error())
+			respondError(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		now := time.Now().UTC()
-		if req.ID == "" {
-			req.ID = slug(firstNonEmpty(req.Name, manifest.Name, req.URL))
-		}
-		if req.Name == "" {
-			req.Name = firstNonEmpty(manifest.Name, req.ID)
-		}
-		req.Enabled = true
-		req.CreatedAt = now
-		req.UpdatedAt = now
-
-		s.mu.Lock()
-		replaced := false
-		for i := range s.config.Manifests {
-			if s.config.Manifests[i].ID == req.ID || strings.EqualFold(s.config.Manifests[i].URL, req.URL) {
-				req.CreatedAt = s.config.Manifests[i].CreatedAt
-				s.config.Manifests[i] = req
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			s.config.Manifests = append(s.config.Manifests, req)
-		}
-		err = s.saveLocked()
-		s.mu.Unlock()
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, "failed to save manifest")
-			return
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"manifest": req})
+		respondJSON(w, http.StatusOK, map[string]any{"manifest": manifest})
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -505,6 +602,61 @@ func (s *appState) handleManifestByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *appState) installManifest(ctx context.Context, req installedManifest) (installedManifest, error) {
+	req.URL = normalizeManifestURL(req.URL)
+	if req.URL == "" {
+		return installedManifest{}, fmt.Errorf("manifest URL is required")
+	}
+	manifest, _, err := s.fetchManifest(ctx, req.URL, true)
+	if err != nil {
+		return installedManifest{}, fmt.Errorf("manifest validation failed: %w", err)
+	}
+	now := time.Now().UTC()
+	if req.ID == "" {
+		req.ID = slug(firstNonEmpty(req.Name, manifest.Name, req.URL))
+	}
+	if req.Name == "" {
+		req.Name = firstNonEmpty(manifest.Name, req.ID)
+	}
+	req.Enabled = true
+	req.CreatedAt = now
+	req.UpdatedAt = now
+
+	s.mu.Lock()
+	replaced := false
+	for i := range s.config.Manifests {
+		if s.config.Manifests[i].ID == req.ID || strings.EqualFold(s.config.Manifests[i].URL, req.URL) {
+			req.CreatedAt = s.config.Manifests[i].CreatedAt
+			s.config.Manifests[i] = req
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.config.Manifests = append(s.config.Manifests, req)
+	}
+	err = s.saveLocked()
+	s.mu.Unlock()
+	if err != nil {
+		return installedManifest{}, fmt.Errorf("failed to save manifest: %w", err)
+	}
+	return req, nil
+}
+
+func (s *appState) removeGeneratedManifests() {
+	s.mu.Lock()
+	next := s.config.Manifests[:0]
+	for _, item := range s.config.Manifests {
+		if item.ID == "vortexo-aiometadata" || item.ID == "vortexo-aiostreams" {
+			continue
+		}
+		next = append(next, item)
+	}
+	s.config.Manifests = next
+	_ = s.saveLocked()
+	s.mu.Unlock()
 }
 
 func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
@@ -750,6 +902,482 @@ func (s *appState) getJSON(ctx context.Context, rawURL string, target any) error
 	return json.Unmarshal(body, target)
 }
 
+func (s *appState) postJSON(ctx context.Context, rawURL string, payload any, target any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "VortexoManifestBridge/1.0")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if err != nil {
+		return err
+	}
+	if len(respBody) > 0 && target != nil {
+		_ = json.Unmarshal(respBody, target)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		detail := responseMessage(respBody)
+		if detail == "" {
+			detail = string(respBody)
+		}
+		if len(detail) > 500 {
+			detail = detail[:500]
+		}
+		if detail != "" {
+			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, detail)
+		}
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (s *appState) createAIOMetadataSetup(ctx context.Context, req aiometadataSetupRequest, password string) (generatedManifest, []string, error) {
+	instances := normalizedInstances(req.Instance, req.Instances, []string{
+		"https://aiometadata.viren070.me",
+		"https://aiometadatafortheweebs.midnightignite.me",
+	})
+	language := firstNonEmpty(req.Language, "en-US")
+	rpdb := firstNonEmpty(req.RPDBAPIKey, "t0-free-rpdb")
+	config := buildAIOMetadataConfig(aiometadataConfigOptions{
+		Language:        language,
+		TMDBAPIKey:      req.TMDBAPIKey,
+		TMDBAccessToken: req.TMDBAccessToken,
+		TVDBAPIKey:      req.TVDBAPIKey,
+		GeminiAPIKey:    req.GeminiAPIKey,
+		RPDBAPIKey:      rpdb,
+		IncludeAdult:    req.IncludeAdult,
+	})
+
+	var warnings []string
+	for _, instance := range instances {
+		base := strings.TrimRight(instance, "/")
+		var response struct {
+			Success    bool   `json:"success"`
+			UserUUID   string `json:"userUUID"`
+			InstallURL string `json:"installUrl"`
+			Message    string `json:"message"`
+			Error      any    `json:"error"`
+		}
+		err := s.postJSON(ctx, base+"/api/config/save", map[string]any{
+			"password": password,
+			"config":   config,
+		}, &response)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("AIOMetadata %s failed: %v", base, err))
+			continue
+		}
+		if response.UserUUID == "" && response.InstallURL == "" {
+			warnings = append(warnings, fmt.Sprintf("AIOMetadata %s returned no manifest URL", base))
+			continue
+		}
+		manifestURL := firstNonEmpty(response.InstallURL, base+"/stremio/"+response.UserUUID+"/manifest.json")
+		return generatedManifest{
+			Kind:        "aiometadata",
+			Name:        "AIOMetadata Catalogs",
+			Instance:    base,
+			ManifestURL: manifestURL,
+			UUID:        response.UserUUID,
+		}, warnings, nil
+	}
+	return generatedManifest{}, warnings, fmt.Errorf("all AIOMetadata instances failed")
+}
+
+func (s *appState) createAIOStreamsSetup(ctx context.Context, req aiostreamsSetupRequest, password string) (generatedManifest, []string, error) {
+	instances := normalizedInstances(req.Instance, req.Instances, []string{
+		"https://aiostreams.fortheweak.cloud",
+		"https://aiostreamsfortheweebsstable.midnightignite.me",
+		"https://aiostreams.viren070.me",
+	})
+	config, err := buildAIOStreamsConfig(req)
+	if err != nil {
+		return generatedManifest{}, nil, err
+	}
+
+	var warnings []string
+	for _, instance := range instances {
+		base := strings.TrimRight(instance, "/")
+		var response struct {
+			Success bool `json:"success"`
+			Data    struct {
+				UUID              string `json:"uuid"`
+				EncryptedPassword string `json:"encryptedPassword"`
+			} `json:"data"`
+			Error any `json:"error"`
+		}
+		err := s.postJSON(ctx, base+"/api/v1/user", map[string]any{
+			"password": password,
+			"config":   config,
+		}, &response)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("AIOStreams %s failed: %v", base, err))
+			continue
+		}
+		if response.Data.UUID == "" || response.Data.EncryptedPassword == "" {
+			warnings = append(warnings, fmt.Sprintf("AIOStreams %s returned no manifest URL", base))
+			continue
+		}
+		manifestURL := base + "/stremio/" + response.Data.UUID + "/" + response.Data.EncryptedPassword + "/manifest.json"
+		return generatedManifest{
+			Kind:        "aiostreams",
+			Name:        "AIOStreams Sources",
+			Instance:    base,
+			ManifestURL: manifestURL,
+			UUID:        response.Data.UUID,
+		}, warnings, nil
+	}
+	return generatedManifest{}, warnings, fmt.Errorf("all AIOStreams instances failed")
+}
+
+type aiometadataConfigOptions struct {
+	Language        string
+	TMDBAPIKey      string
+	TMDBAccessToken string
+	TVDBAPIKey      string
+	GeminiAPIKey    string
+	RPDBAPIKey      string
+	IncludeAdult    bool
+}
+
+func buildAIOMetadataConfig(opts aiometadataConfigOptions) map[string]any {
+	return map[string]any{
+		"language":                      firstNonEmpty(opts.Language, "en-US"),
+		"includeAdult":                  opts.IncludeAdult,
+		"searchEnabled":                 true,
+		"tvdbSeasonType":                "default",
+		"usePosterProxy":                true,
+		"displayAgeRating":              false,
+		"showRateMeButton":              false,
+		"posterRatingProvider":          "rpdb",
+		"showDisabledCatalogs":          false,
+		"hideUnreleasedDigital":         true,
+		"hideUnreleasedDigitalSearch":   false,
+		"showMetaProviderAttribution":   false,
+		"enableRatingPostersForLibrary": true,
+		"catalogSetupComplete":          true,
+		"ageRating":                     "None",
+		"castCount":                     10,
+		"providers": map[string]any{
+			"anime":                     "kitsu",
+			"movie":                     "tmdb",
+			"series":                    "tmdb",
+			"anime_id_provider":         "imdb",
+			"forceAnimeForDetectedImdb": true,
+		},
+		"artProviders": map[string]any{
+			"anime":          "tvdb",
+			"movie":          "tmdb",
+			"series":         "tvdb",
+			"englishArtOnly": false,
+		},
+		"mal": map[string]any{
+			"skipRecap":                    true,
+			"skipFiller":                   false,
+			"allowEpisodeMarking":          false,
+			"useImdbIdForCatalogAndSearch": true,
+		},
+		"sfw": true,
+		"tmdb": map[string]any{
+			"scrapeImdb":          true,
+			"forceLatinCastNames": false,
+		},
+		"search": map[string]any{
+			"enabled":             true,
+			"providers":           []string{"tmdb", "tvdb"},
+			"ai_enabled":          opts.GeminiAPIKey != "",
+			"searchOrder":         []string{"movie", "series"},
+			"engineEnabled":       false,
+			"engineRatingPosters": true,
+		},
+		"apiKeys": map[string]any{
+			"gemini":                 opts.GeminiAPIKey,
+			"tmdb":                   opts.TMDBAPIKey,
+			"tmdbAccessToken":        opts.TMDBAccessToken,
+			"tvdb":                   opts.TVDBAPIKey,
+			"fanart":                 "",
+			"rpdb":                   firstNonEmpty(opts.RPDBAPIKey, "t0-free-rpdb"),
+			"topPoster":              "",
+			"mdblist":                "",
+			"traktTokenId":           "",
+			"simklTokenId":           "",
+			"anilistTokenId":         "",
+			"customDescriptionBlurb": "",
+		},
+		"catalogs": vortexoCatalogPreset(),
+	}
+}
+
+func vortexoCatalogPreset() []map[string]any {
+	base := []struct {
+		ID     string
+		Name   string
+		Type   string
+		Source string
+	}{
+		{"tmdb.top", "Popular Movies", "movie", "tmdb"},
+		{"tmdb.trending", "Trending Movies", "movie", "tmdb"},
+		{"tmdb.top_rated", "Top Rated Movies", "movie", "tmdb"},
+		{"tmdb.top", "Popular TV", "series", "tmdb"},
+		{"tmdb.trending", "Trending TV", "series", "tmdb"},
+		{"tmdb.top_rated", "Top Rated TV", "series", "tmdb"},
+		{"tmdb.discover.movie.genres.action", "Action Movies", "movie", "tmdb"},
+		{"tmdb.discover.movie.genres.comedy", "Comedy Movies", "movie", "tmdb"},
+		{"tmdb.discover.movie.genres.horror", "Horror Movies", "movie", "tmdb"},
+		{"tmdb.discover.movie.genres.science-fiction", "Sci-Fi Movies", "movie", "tmdb"},
+		{"tmdb.discover.series.genres.drama", "Drama TV", "series", "tmdb"},
+		{"tmdb.discover.series.genres.documentary", "Documentary TV", "series", "tmdb"},
+	}
+	catalogs := make([]map[string]any, 0, len(base))
+	for _, item := range base {
+		catalogs = append(catalogs, map[string]any{
+			"id":         item.ID,
+			"name":       item.Name,
+			"type":       item.Type,
+			"source":     item.Source,
+			"sort":       "default",
+			"order":      "asc",
+			"enabled":    true,
+			"showInHome": true,
+		})
+	}
+	return catalogs
+}
+
+func buildAIOStreamsConfig(req aiostreamsSetupRequest) (map[string]any, error) {
+	timeout := req.TimeoutMS
+	if timeout <= 0 {
+		timeout = 5000
+	}
+	provider := strings.ToLower(strings.TrimSpace(req.DebridProvider))
+	debridKey := strings.TrimSpace(req.DebridAPIKey)
+	if provider != "" && provider != "none" && debridKey == "" {
+		return nil, fmt.Errorf("debrid API key is required when a debrid provider is selected")
+	}
+	hasDebrid := provider != "" && provider != "none" && debridKey != ""
+	hasTMDB := strings.TrimSpace(req.TMDBAPIKey) != "" || strings.TrimSpace(req.TMDBAccessToken) != ""
+	includeP2P := req.IncludeP2P || !hasDebrid
+	languages := req.Languages
+	if len(languages) == 0 {
+		languages = []string{"English"}
+	}
+
+	presets := []map[string]any{
+		{
+			"type":       "torrentio",
+			"instanceId": "tio",
+			"enabled":    true,
+			"options": map[string]any{
+				"name":                 "Torrentio",
+				"timeout":              timeout,
+				"resources":            []string{"stream"},
+				"providers":            []string{},
+				"useMultipleInstances": false,
+			},
+		},
+		{
+			"type":       "comet",
+			"instanceId": "com",
+			"enabled":    true,
+			"options": map[string]any{
+				"name":        "Comet",
+				"timeout":     timeout,
+				"resources":   []string{"stream"},
+				"includeP2P":  includeP2P,
+				"removeTrash": false,
+				"mediaTypes":  []string{},
+			},
+		},
+		{
+			"type":       "meteor",
+			"instanceId": "met",
+			"enabled":    true,
+			"options": map[string]any{
+				"name":                 "Meteor",
+				"timeout":              timeout,
+				"resources":            []string{"stream"},
+				"includeP2P":           includeP2P,
+				"removeTrash":          false,
+				"useMultipleInstances": false,
+				"mediaTypes":           []string{},
+			},
+		},
+	}
+	if provider == "torbox" {
+		presets = append([]map[string]any{{
+			"type":       "torbox-search",
+			"instanceId": "tbs",
+			"enabled":    true,
+			"options": map[string]any{
+				"name":                      "TB Search",
+				"timeout":                   timeout,
+				"sources":                   []string{"torrent"},
+				"mediaTypes":                []string{},
+				"userSearchEngines":         true,
+				"onlyShowUserSearchResults": false,
+				"useMultipleInstances":      false,
+			},
+		}}, presets...)
+	}
+
+	services := []map[string]any{}
+	if hasDebrid {
+		services = append(services, map[string]any{
+			"id":      provider,
+			"enabled": true,
+			"credentials": map[string]any{
+				"apiKey": debridKey,
+			},
+		})
+	}
+
+	return map[string]any{
+		"addonName":            "Vortexo Sources",
+		"services":             services,
+		"presets":              presets,
+		"formatter":            vortexoStreamFormatter(),
+		"preferredQualities":   []string{"BluRay", "BluRay REMUX", "WEB-DL", "WEBRip"},
+		"preferredResolutions": []string{"2160p", "1440p", "1080p", "720p"},
+		"excludedQualities":    []string{"CAM", "TS", "TC", "SCR"},
+		"excludedVisualTags":   []string{"3D"},
+		"preferredLanguages":   append(append([]string{}, languages...), "Original", "Dual Audio", "Multi", "Unknown"),
+		"requiredLanguages":    []string{},
+		"preferredVisualTags":  []string{"HDR+DV", "HDR10+", "HDR10", "DV", "HDR"},
+		"preferredAudioTags":   []string{"Atmos", "DD+", "DD"},
+		"preferredEncodes":     []string{"AV1", "HEVC", "AVC", "Unknown"},
+		"sortCriteria": map[string]any{
+			"global": []map[string]string{{"key": "cached", "direction": "desc"}},
+			"cached": []map[string]string{
+				{"key": "resolution", "direction": "desc"},
+				{"key": "quality", "direction": "desc"},
+				{"key": "language", "direction": "desc"},
+				{"key": "bitrate", "direction": "desc"},
+			},
+			"uncached": []map[string]string{
+				{"key": "resolution", "direction": "desc"},
+				{"key": "quality", "direction": "desc"},
+				{"key": "seeders", "direction": "desc"},
+			},
+		},
+		"deduplicator": map[string]any{
+			"enabled":       true,
+			"excludeAddons": []string{},
+			"keys":          []string{"filename", "infoHash", "smartDetect"},
+			"cached":        "single_result",
+			"uncached":      "per_service",
+			"p2p":           "single_result",
+		},
+		"hideErrors": true,
+		"preloadStreams": map[string]any{
+			"enabled": true,
+		},
+		"titleMatching": map[string]any{
+			"enabled":             hasTMDB,
+			"mode":                "exact",
+			"similarityThreshold": 1,
+			"requestTypes":        []string{"movie", "series", "anime"},
+			"addons":              []string{},
+		},
+		"yearMatching": map[string]any{
+			"enabled":      hasTMDB,
+			"strict":       true,
+			"requestTypes": []string{"movie", "series", "anime"},
+			"addons":       []string{},
+		},
+		"seasonEpisodeMatching": map[string]any{
+			"enabled":      true,
+			"strict":       true,
+			"requestTypes": []string{"series"},
+			"addons":       []string{},
+		},
+		"digitalReleaseFilter": map[string]any{
+			"enabled":      hasTMDB,
+			"requestTypes": []string{"movie", "series"},
+			"tolerance":    10,
+			"addons":       []string{},
+		},
+		"rpdbApiKey":      firstNonEmpty(req.RPDBAPIKey, "t0-free-rpdb"),
+		"tmdbApiKey":      req.TMDBAPIKey,
+		"tmdbAccessToken": req.TMDBAccessToken,
+		"tvdbApiKey":      req.TVDBAPIKey,
+		"cacheAndPlay":    map[string]any{"enabled": true, "streamTypes": []string{"usenet"}},
+		"trusted":         false,
+		"groups":          map[string]any{"enabled": false, "behaviour": "parallel", "addons": []string{}},
+	}, nil
+}
+
+func vortexoStreamFormatter() map[string]any {
+	return map[string]any{
+		"id": "custom",
+		"definition": map[string]any{
+			"name":        `{service.cached::istrue["⚡ "||""]}{stream.resolution::exists["{stream.resolution} "||""]}{stream.quality::exists["{stream.quality} "||""]}{addon.name}`,
+			"description": `{stream.filename::exists["{stream.filename}\n"||""]}{stream.size::>0["{stream.size::sbytes}\n"||""]}{stream.visualTags::exists["{stream.visualTags::join(' · ')}\n"||""]}{stream.audioTags::exists["{stream.audioTags::join(' · ')}"||""]}`,
+		},
+	}
+}
+
+func normalizedInstances(primary string, extra []string, defaults []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		value = strings.TrimRight(value, "/")
+		if seen[value] {
+			return
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	add(primary)
+	for _, value := range extra {
+		add(value)
+	}
+	for _, value := range defaults {
+		add(value)
+	}
+	return out
+}
+
+func responseMessage(body []byte) string {
+	var decoded any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return ""
+	}
+	return findMessage(decoded)
+}
+
+func findMessage(value any) string {
+	switch v := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"message", "detail", "error"} {
+			if found := findMessage(v[key]); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if found := findMessage(item); found != "" {
+				return found
+			}
+		}
+	case string:
+		return v
+	}
+	return ""
+}
+
 func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem {
 	mediaType := normalizeCatalogType(firstNonEmpty(meta.Type, fallbackType))
 	title := firstNonEmpty(meta.Name, meta.Title, "Untitled")
@@ -925,6 +1553,20 @@ func randomToken() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return base64.RawURLEncoding.EncodeToString(data[:])
+}
+
+func randomSetupPassword() string {
+	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+	var data [20]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "Vtx" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	var out strings.Builder
+	out.WriteString("Vtx")
+	for _, b := range data {
+		out.WriteByte(chars[int(b)%len(chars)])
+	}
+	return out.String()
 }
 
 func respondJSON(w http.ResponseWriter, status int, value any) {
@@ -1261,13 +1903,85 @@ const indexHTML = `<!doctype html>
       <div id="accounts" class="pane">
         <div class="panel">
           <h2>Prepare Accounts and Keys</h2>
-          <p class="muted">Use this as a checklist before creating your upstream addon configs. Vortexo Bridge does not need these keys directly; AIOStreams and AIOMetadata ask for them when you create their manifest URLs.</p>
+          <p class="muted">Enter your own keys here and Vortexo Bridge will create AIOMetadata and AIOStreams manifests for you. Keys are sent to the selected upstream addon instance to create its normal manifest configuration; Vortexo Bridge stores only the returned manifest URLs.</p>
           <div class="checklist">
             <label class="check"><input type="checkbox" data-check="debrid"><span><strong>Debrid account</strong><br><span class="muted">Real-Debrid, TorBox, Premiumize, AllDebrid, or another provider supported by your AIOStreams instance.</span></span></label>
             <label class="check"><input type="checkbox" data-check="tmdb"><span><strong>TMDB key</strong><br><span class="muted">Helps metadata and catalog quality when your AIOMetadata instance requests it.</span></span></label>
             <label class="check"><input type="checkbox" data-check="tvdb"><span><strong>TVDB key</strong><br><span class="muted">Useful for TV matching and richer series metadata if your instance supports it.</span></span></label>
             <label class="check"><input type="checkbox" data-check="gemini"><span><strong>Gemini key</strong><br><span class="muted">Optional. Some AIOMetadata search or recommendations features may use it.</span></span></label>
             <label class="check"><input type="checkbox" data-check="rpdb"><span><strong>RPDB key</strong><br><span class="muted">Optional poster ratings. Many guides use the free key <code>t0-free-rpdb</code>.</span></span></label>
+          </div>
+          <div class="panel" style="margin-top:18px;">
+            <h3>Generate Perfect Setup</h3>
+            <div class="two">
+              <div>
+                <label>Debrid Provider</label>
+                <select id="debridProvider">
+                  <option value="none">None / P2P only</option>
+                  <option value="realdebrid">Real-Debrid</option>
+                  <option value="torbox">TorBox</option>
+                  <option value="premiumize">Premiumize</option>
+                  <option value="alldebrid">AllDebrid</option>
+                  <option value="debridlink">Debrid-Link</option>
+                  <option value="easydebrid">EasyDebrid</option>
+                </select>
+              </div>
+              <div>
+                <label>Debrid API Key</label>
+                <input id="debridApiKey" type="password" placeholder="Required when a provider is selected">
+              </div>
+              <div>
+                <label>AIOStreams Instance</label>
+                <select id="aiostreamsInstance">
+                  <option value="https://aiostreams.fortheweak.cloud">AIOStreams Fortheweak</option>
+                  <option value="https://aiostreamsfortheweebsstable.midnightignite.me">AIOStreams Midnight</option>
+                  <option value="https://aiostreams.viren070.me">AIOStreams Viren</option>
+                </select>
+              </div>
+              <div>
+                <label>AIOMetadata Instance</label>
+                <select id="aiometadataInstance">
+                  <option value="https://aiometadata.viren070.me">AIOMetadata Viren</option>
+                  <option value="https://aiometadatafortheweebs.midnightignite.me">AIOMetadata Midnight</option>
+                </select>
+              </div>
+              <div>
+                <label>TMDB API Key</label>
+                <input id="tmdbApiKey" type="password" placeholder="Optional, recommended">
+              </div>
+              <div>
+                <label>TMDB Read Token</label>
+                <input id="tmdbAccessToken" type="password" placeholder="Optional">
+              </div>
+              <div>
+                <label>TVDB API Key</label>
+                <input id="tvdbApiKey" type="password" placeholder="Optional">
+              </div>
+              <div>
+                <label>Gemini API Key</label>
+                <input id="geminiApiKey" type="password" placeholder="Optional">
+              </div>
+              <div>
+                <label>RPDB API Key</label>
+                <input id="rpdbApiKey" type="password" placeholder="Optional, defaults to t0-free-rpdb">
+              </div>
+              <div>
+                <label>Preferred Language</label>
+                <select id="preferredLanguage">
+                  <option value="English">English</option>
+                  <option value="Croatian">Croatian</option>
+                  <option value="Arabic">Arabic</option>
+                  <option value="French">French</option>
+                  <option value="German">German</option>
+                  <option value="Spanish">Spanish</option>
+                </select>
+              </div>
+            </div>
+            <div class="actions">
+              <button onclick="generatePerfectSetup()">Generate & Install</button>
+              <button class="secondary" onclick="saveChecklist(); showStep('install')">Use Manual Manifest URLs</button>
+            </div>
+            <div id="generateStatus" class="message muted"></div>
           </div>
           <div class="actions">
             <button onclick="saveChecklist(); showStep('catalogs')">Continue</button>
@@ -1465,6 +2179,66 @@ async function installSetup() {
   }
   manifestStatus.textContent = "Setup installed.";
   manifestStatus.className = "ok";
+  markDone("catalogs");
+  markDone("streams");
+  markDone("install");
+  await loadManifests();
+  showStep("finish");
+}
+async function generatePerfectSetup() {
+  if (!token) { generateStatus.textContent = "Sign in first."; generateStatus.className = "error"; showStep("signin"); return; }
+  generateStatus.textContent = "Creating AIOMetadata and AIOStreams manifests...";
+  generateStatus.className = "message muted";
+  const provider = debridProvider.value || "none";
+  const payload = {
+    install: true,
+    replace_existing: true,
+    aiometadata: {
+      enabled: true,
+      instance: aiometadataInstance.value,
+      language: "en-US",
+      tmdb_api_key: tmdbApiKey.value.trim(),
+      tmdb_access_token: tmdbAccessToken.value.trim(),
+      tvdb_api_key: tvdbApiKey.value.trim(),
+      gemini_api_key: geminiApiKey.value.trim(),
+      rpdb_api_key: rpdbApiKey.value.trim()
+    },
+    aiostreams: {
+      enabled: true,
+      instance: aiostreamsInstance.value,
+      debrid_provider: provider === "none" ? "" : provider,
+      debrid_api_key: debridApiKey.value.trim(),
+      tmdb_api_key: tmdbApiKey.value.trim(),
+      tmdb_access_token: tmdbAccessToken.value.trim(),
+      tvdb_api_key: tvdbApiKey.value.trim(),
+      rpdb_api_key: rpdbApiKey.value.trim(),
+      languages: [preferredLanguage.value || "English"],
+      timeout_ms: 5000,
+      include_p2p: provider === "none"
+    }
+  };
+  const res = await fetch("/api/v1/bridge/perfect-setup", {method:"POST", headers:{"content-type":"application/json", authorization:"Bearer " + token}, body: JSON.stringify(payload)});
+  const data = await res.json();
+  if (!res.ok) {
+    generateStatus.textContent = data.message || "Setup failed";
+    generateStatus.className = "error";
+    return;
+  }
+  const catalog = (data.generated || []).find((item) => item.kind === "aiometadata");
+  const streams = (data.generated || []).find((item) => item.kind === "aiostreams");
+  if (catalog) {
+    catalogManifestUrl.value = catalog.manifest_url;
+    installCatalogUrl.value = catalog.manifest_url;
+    localStorage.setItem("vortexoCatalogManifestUrl", catalog.manifest_url);
+  }
+  if (streams) {
+    streamManifestUrl.value = streams.manifest_url;
+    installStreamUrl.value = streams.manifest_url;
+    localStorage.setItem("vortexoStreamManifestUrl", streams.manifest_url);
+  }
+  generateStatus.innerHTML = "Generated and installed. Addon password: <code>" + escapeHtml(data.credentials?.password || "") + "</code>";
+  generateStatus.className = "message ok";
+  markDone("accounts");
   markDone("catalogs");
   markDone("streams");
   markDone("install");

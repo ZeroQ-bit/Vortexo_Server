@@ -19,13 +19,19 @@ Open the server in a browser to use the setup wizard. It walks through:
 
 - Signing in with the bridge credentials
 - Preparing debrid, TMDB, TVDB, Gemini, and RPDB account requirements
-- Creating or pasting an AIOMetadata catalog manifest
-- Creating or pasting an AIOStreams source manifest
+- Generating an AIOMetadata catalog manifest from Vortexo's compact preset
+- Generating an AIOStreams source manifest from Vortexo's compact preset
+- Pasting existing manifest URLs manually when you want a custom external setup
 - Installing those manifests into Vortexo Bridge
 - Connecting the Vortexo Apple TV app to the same server URL
 
-Vortexo Bridge stores installed manifest URLs. Third-party keys remain in the
-upstream addon configurations that generated those manifests.
+Vortexo Bridge stores installed manifest URLs. Third-party keys are sent to the
+selected upstream addon instances only to create their normal manifest
+configuration.
+
+The setup endpoint is available at:
+
+- `POST /api/v1/bridge/perfect-setup`
 
 ## Local Run
 
