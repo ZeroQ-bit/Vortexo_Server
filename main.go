@@ -926,14 +926,19 @@ func (s *appState) handleMovieByID(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "movie not found")
 		return
 	}
+	if tail == "videos" {
+		videos, err := s.findManifestVideos(r.Context(), "movie", id)
+		if err != nil {
+			respondError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"videos": videos})
+		return
+	}
 
 	meta, err := s.findManifestMeta(r.Context(), "movie", id)
 	if err != nil {
 		respondError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	if tail == "videos" {
-		respondJSON(w, http.StatusOK, map[string]any{"videos": manifestVideosFromStremio(meta)})
 		return
 	}
 	if tail != "" {
@@ -953,6 +958,15 @@ func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusNotFound, "series not found")
 		return
 	}
+	if tail == "videos" {
+		videos, err := s.findManifestVideos(r.Context(), "series", id)
+		if err != nil {
+			respondError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"videos": videos})
+		return
+	}
 
 	meta, err := s.findManifestMeta(r.Context(), "series", id)
 	if err != nil {
@@ -965,8 +979,6 @@ func (s *appState) handleSeriesByID(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusOK, map[string]any{"series": manifestDetailFromStremio(meta, "series")})
 	case "episodes":
 		respondJSON(w, http.StatusOK, map[string]any{"episodes": manifestEpisodesFromStremio(meta)})
-	case "videos":
-		respondJSON(w, http.StatusOK, map[string]any{"videos": manifestVideosFromStremio(meta)})
 	default:
 		respondError(w, http.StatusNotFound, "series endpoint not found")
 	}
@@ -1182,6 +1194,52 @@ func (s *appState) findManifestMeta(ctx context.Context, mediaType, id string) (
 		return stremioMeta{}, fmt.Errorf("manifest metadata not found: %w", lastErr)
 	}
 	return stremioMeta{}, fmt.Errorf("manifest metadata not found")
+}
+
+func (s *appState) findManifestVideos(ctx context.Context, mediaType, id string) ([]map[string]any, error) {
+	stremioType := normalizeStremioType(mediaType)
+	if stremioType == "" {
+		return nil, fmt.Errorf("unsupported media type")
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("missing media id")
+	}
+
+	var lastErr error
+	foundMetadata := false
+	for _, item := range s.enabledManifests() {
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !manifestSupportsResource(manifest, "meta") || !manifestSupportsType(manifest, stremioType) {
+			continue
+		}
+		meta, err := s.fetchMeta(ctx, base, stremioType, id)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		meta = canonicalStremioMeta(meta, id, stremioType)
+		if strings.TrimSpace(meta.ID) == "" && strings.TrimSpace(meta.Name) == "" {
+			continue
+		}
+
+		foundMetadata = true
+		if videos := manifestVideosFromStremio(meta); len(videos) > 0 {
+			return videos, nil
+		}
+	}
+
+	if foundMetadata {
+		return []map[string]any{}, nil
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("manifest metadata not found: %w", lastErr)
+	}
+	return nil, fmt.Errorf("manifest metadata not found")
 }
 
 func (s *appState) fetchMeta(ctx context.Context, base string, mediaType string, id string) (stremioMeta, error) {
