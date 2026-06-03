@@ -156,6 +156,9 @@ type stremioMeta struct {
 	Type           string                 `json:"type"`
 	Name           string                 `json:"name"`
 	Title          string                 `json:"title"`
+	URL            string                 `json:"url"`
+	StreamURL      string                 `json:"streamUrl"`
+	ExternalURL    string                 `json:"externalUrl"`
 	Description    string                 `json:"description"`
 	Poster         string                 `json:"poster"`
 	PosterShape    string                 `json:"posterShape"`
@@ -282,6 +285,53 @@ type vortexoHomeItem struct {
 	UpdatedAt        int64    `json:"updated_at,omitempty"`
 }
 
+type vortexoLiveChannel struct {
+	ID             string `json:"id"`
+	StreamID       int    `json:"stream_id,omitempty"`
+	EPGChannelID   string `json:"epg_channel_id,omitempty"`
+	CategoryID     string `json:"category_id,omitempty"`
+	Name           string `json:"name"`
+	Logo           string `json:"logo,omitempty"`
+	StreamIcon     string `json:"stream_icon,omitempty"`
+	StreamURL      string `json:"stream_url,omitempty"`
+	URL            string `json:"url,omitempty"`
+	Category       string `json:"category,omitempty"`
+	CategoryName   string `json:"category_name,omitempty"`
+	Language       string `json:"language,omitempty"`
+	Country        string `json:"country,omitempty"`
+	IsLive         bool   `json:"is_live"`
+	Active         bool   `json:"active"`
+	Source         string `json:"source,omitempty"`
+	HasEPG         bool   `json:"has_epg"`
+	ManifestBase   string `json:"-"`
+	ManifestName   string `json:"-"`
+	ManifestID     string `json:"-"`
+	CatalogType    string `json:"-"`
+	CatalogID      string `json:"-"`
+	OriginalItemID string `json:"-"`
+}
+
+type vortexoLiveTVRow struct {
+	ID     string                 `json:"id"`
+	Title  string                 `json:"title"`
+	Reason string                 `json:"reason,omitempty"`
+	Items  []vortexoLiveTVRowItem `json:"items"`
+}
+
+type vortexoLiveTVRowItem struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Logo     string `json:"logo,omitempty"`
+	Category string `json:"category,omitempty"`
+	Source   string `json:"source,omitempty"`
+	HasEPG   bool   `json:"has_epg"`
+}
+
+type xtreamLiveCategory struct {
+	CategoryID   string `json:"category_id"`
+	CategoryName string `json:"category_name"`
+}
+
 type vortexoManifestDetail struct {
 	vortexoHomeItem
 	NumberOfSeasons  int                      `json:"number_of_seasons,omitempty"`
@@ -406,16 +456,19 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/series/", s.handleSeriesByID)
 	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/stats", s.handleStats)
-	mux.HandleFunc("/api/v1/channels", s.handleEmptyList)
-	mux.HandleFunc("/api/v1/channels/", s.handleEmptyList)
+	mux.HandleFunc("/api/v1/channels", s.handleChannels)
+	mux.HandleFunc("/api/v1/channels/", s.handleChannels)
 	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/vortexo/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
+	mux.HandleFunc("/api/v1/vortexo/live-tv/rows", s.handleVortexoLiveTVRows)
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
 	mux.HandleFunc("/api/v1/vortexo/subtitles/", s.handleVortexoSubtitles)
 	mux.HandleFunc("/player_api.php", s.handleXtreamPlayerAPI)
+	mux.HandleFunc("/xmltv.php", s.handleXMLTV)
+	mux.HandleFunc("/live/", s.handleLivePlayback)
 }
 
 func (s *appState) load() error {
@@ -577,9 +630,10 @@ func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 		"metadata":             true,
 		"seasons":              true,
 		"episodes":             true,
+		"live_tv":              true,
 		"manifest_bridge":      true,
 		"requires_app_changes": false,
-		"types":                []string{"movie", "show", "season", "episode"},
+		"types":                []string{"movie", "show", "season", "episode", "live_tv"},
 	})
 }
 
@@ -831,6 +885,98 @@ func (s *appState) handleEmptyList(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{"items": []any{}, "channels": []any{}})
 }
 
+func (s *appState) handleChannels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if strings.Contains(r.URL.Path, "/epg/guide") {
+		respondJSON(w, http.StatusOK, map[string]any{"channels": []any{}, "items": []any{}})
+		return
+	}
+	limit := boundedInt(r.URL.Query().Get("limit"), 500, 1, 1000)
+	channels := s.collectLiveChannels(r.Context(), limit)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"channels": channels,
+		"items":    channels,
+		"results":  channels,
+	})
+}
+
+func (s *appState) handleVortexoLiveTVRows(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), 8, 1, 12)
+	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
+	channels := s.collectLiveChannels(r.Context(), rowLimit*itemLimit)
+	rows := liveRowsFromChannels(
+		channels,
+		commaSet(r.URL.Query().Get("favorite_ids")),
+		commaSet(r.URL.Query().Get("recent_ids")),
+		rowLimit,
+		itemLimit,
+	)
+
+	respondJSON(w, http.StatusOK, map[string]any{"rows": rows})
+}
+
+func (s *appState) handleXMLTV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><tv generator-info-name="Vortexo Manifest Server"></tv>`))
+}
+
+func (s *appState) handleLivePlayback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	streamID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/live/"), "/")
+	parts := strings.Split(streamID, "/")
+	if len(parts) > 0 {
+		streamID = parts[len(parts)-1]
+	}
+	streamID = strings.TrimSuffix(streamID, ".m3u8")
+	streamID = strings.TrimSuffix(streamID, ".ts")
+	streamID = strings.TrimSpace(streamID)
+	if streamID == "" {
+		respondError(w, http.StatusNotFound, "channel not found")
+		return
+	}
+
+	channels := s.collectLiveChannels(r.Context(), 1000)
+	var match *vortexoLiveChannel
+	for i := range channels {
+		if strings.EqualFold(channels[i].ID, streamID) || strconv.Itoa(channels[i].StreamID) == streamID {
+			match = &channels[i]
+			break
+		}
+	}
+	if match == nil {
+		respondError(w, http.StatusNotFound, "channel not found")
+		return
+	}
+
+	playURL, err := s.resolveLiveChannelURL(r.Context(), *match)
+	if err != nil || strings.TrimSpace(playURL) == "" {
+		if err == nil {
+			err = fmt.Errorf("empty stream URL")
+		}
+		respondError(w, http.StatusBadGateway, "live channel stream unavailable: "+err.Error())
+		return
+	}
+
+	http.Redirect(w, r, playURL, http.StatusTemporaryRedirect)
+}
+
 func (s *appState) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -955,6 +1101,240 @@ func (s *appState) collectManifestItems(ctx context.Context, mediaType string, l
 	}
 
 	return collected
+}
+
+func (s *appState) collectLiveChannels(ctx context.Context, limit int) []vortexoLiveChannel {
+	if limit <= 0 {
+		limit = 500
+	}
+	installed := s.enabledManifests()
+	seen := map[string]bool{}
+	channels := make([]vortexoLiveChannel, 0, minInt(limit, 100))
+	streamID := 1
+
+	for _, item := range installed {
+		if len(channels) >= limit {
+			break
+		}
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			log.Printf("live manifest %s failed: %v", item.URL, err)
+			continue
+		}
+		if !manifestSupportsResource(manifest, "catalog") {
+			continue
+		}
+		for _, catalog := range manifest.Catalogs {
+			if len(channels) >= limit {
+				break
+			}
+			if !isLiveCatalog(manifest, item, catalog) {
+				continue
+			}
+			items, err := s.fetchCatalog(ctx, base, catalog, limit*2)
+			if err != nil {
+				log.Printf("live catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
+				continue
+			}
+			for _, meta := range items {
+				if len(channels) >= limit {
+					break
+				}
+				channel := liveChannelFromStremio(meta, item, manifest, base, catalog, streamID)
+				if channel.ID == "" || channel.Name == "" {
+					continue
+				}
+				if channel.StreamURL == "" && !manifestSupportsResource(manifest, "stream") {
+					continue
+				}
+				key := strings.ToLower(channel.ManifestID + ":" + channel.CatalogType + ":" + channel.ID)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				channels = append(channels, channel)
+				streamID++
+			}
+		}
+	}
+
+	return channels
+}
+
+func liveChannelFromStremio(
+	meta stremioMeta,
+	item installedManifest,
+	manifest stremioManifest,
+	base string,
+	catalog stremioCatalog,
+	streamID int,
+) vortexoLiveChannel {
+	name := firstNonEmpty(meta.Name, meta.Title, meta.OriginalName, meta.OriginalTitle)
+	id := firstNonEmpty(meta.ID, meta.IMDBID, slug(name))
+	category := firstNonEmpty(strings.Join(meta.Genres, ", "), catalog.Name, item.Name, manifest.Name, "Live TV")
+	categoryID := slug(firstNonEmpty(catalog.ID, category, "live-tv"))
+	source := firstNonEmpty(item.Name, manifest.Name, "Vortexo Server")
+	streamURL := absoluteAddonURL(firstNonEmpty(meta.StreamURL, meta.URL, meta.ExternalURL), base)
+	logo := absoluteAddonURL(firstNonEmpty(meta.Logo, meta.Poster, meta.Background), base)
+
+	return vortexoLiveChannel{
+		ID:             id,
+		StreamID:       streamID,
+		EPGChannelID:   id,
+		CategoryID:     categoryID,
+		Name:           firstNonEmpty(name, id, "Channel"),
+		Logo:           logo,
+		StreamIcon:     logo,
+		StreamURL:      streamURL,
+		URL:            streamURL,
+		Category:       category,
+		CategoryName:   category,
+		IsLive:         true,
+		Active:         true,
+		Source:         source,
+		HasEPG:         false,
+		ManifestBase:   base,
+		ManifestName:   manifest.Name,
+		ManifestID:     firstNonEmpty(item.ID, manifest.ID, source),
+		CatalogType:    catalog.Type,
+		CatalogID:      catalog.ID,
+		OriginalItemID: id,
+	}
+}
+
+func (s *appState) resolveLiveChannelURL(ctx context.Context, channel vortexoLiveChannel) (string, error) {
+	if channel.StreamURL != "" {
+		return channel.StreamURL, nil
+	}
+	if channel.ManifestBase == "" || channel.OriginalItemID == "" {
+		return "", fmt.Errorf("missing live channel stream metadata")
+	}
+	return s.fetchLiveStreamURL(ctx, channel.ManifestBase, channel.CatalogType, channel.OriginalItemID)
+}
+
+func (s *appState) fetchLiveStreamURL(ctx context.Context, base string, catalogType string, id string) (string, error) {
+	var lastErr error
+	for _, streamType := range liveStreamTypes(catalogType) {
+		u := fmt.Sprintf("%s/stream/%s/%s.json", strings.TrimRight(base, "/"), url.PathEscape(streamType), url.PathEscape(id))
+		var response stremioStreamResponse
+		if err := s.getJSON(ctx, u, &response); err != nil {
+			lastErr = err
+			continue
+		}
+		for _, stream := range response.Streams {
+			playURL := absoluteAddonURL(firstNonEmpty(stream.URL, stream.ExternalURL), base)
+			if playURL != "" {
+				return playURL, nil
+			}
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("empty stream response")
+}
+
+func liveRowsFromChannels(
+	channels []vortexoLiveChannel,
+	favoriteIDs map[string]bool,
+	recentIDs map[string]bool,
+	rowLimit int,
+	itemLimit int,
+) []vortexoLiveTVRow {
+	rows := make([]vortexoLiveTVRow, 0, rowLimit)
+	if len(channels) == 0 || rowLimit <= 0 {
+		return rows
+	}
+
+	addRow := func(id string, title string, reason string, items []vortexoLiveChannel) {
+		if len(rows) >= rowLimit || len(items) == 0 {
+			return
+		}
+		if len(items) > itemLimit {
+			items = items[:itemLimit]
+		}
+		rowItems := make([]vortexoLiveTVRowItem, 0, len(items))
+		for _, channel := range items {
+			rowItems = append(rowItems, liveRowItemFromChannel(channel))
+		}
+		rows = append(rows, vortexoLiveTVRow{
+			ID:     id,
+			Title:  title,
+			Reason: reason,
+			Items:  rowItems,
+		})
+	}
+
+	if len(favoriteIDs) > 0 {
+		favorites := make([]vortexoLiveChannel, 0, len(favoriteIDs))
+		for _, channel := range channels {
+			if favoriteIDs[channel.ID] {
+				favorites = append(favorites, channel)
+			}
+		}
+		addRow("favorites", "Favorite Channels", "Saved on Apple TV", favorites)
+	}
+
+	if len(recentIDs) > 0 {
+		recent := make([]vortexoLiveChannel, 0, len(recentIDs))
+		for _, channel := range channels {
+			if recentIDs[channel.ID] {
+				recent = append(recent, channel)
+			}
+		}
+		addRow("recent", "Recently Watched", "From this Vortexo Server", recent)
+	}
+
+	addRow("all", "All Channels", fmt.Sprintf("%d channels", len(channels)), channels)
+
+	grouped := map[string][]vortexoLiveChannel{}
+	order := []string{}
+	for _, channel := range channels {
+		category := firstNonEmpty(channel.Category, channel.Source, "Live TV")
+		if _, ok := grouped[category]; !ok {
+			order = append(order, category)
+		}
+		grouped[category] = append(grouped[category], channel)
+	}
+	sort.Strings(order)
+	for _, category := range order {
+		addRow("category-"+slug(category), category, "Installed live manifest", grouped[category])
+	}
+
+	return rows
+}
+
+func liveRowItemFromChannel(channel vortexoLiveChannel) vortexoLiveTVRowItem {
+	return vortexoLiveTVRowItem{
+		ID:       channel.ID,
+		Name:     channel.Name,
+		Logo:     channel.Logo,
+		Category: channel.Category,
+		Source:   channel.Source,
+		HasEPG:   channel.HasEPG,
+	}
+}
+
+func liveCategoriesFromChannels(channels []vortexoLiveChannel) []xtreamLiveCategory {
+	seen := map[string]bool{}
+	categories := make([]xtreamLiveCategory, 0)
+	for _, channel := range channels {
+		id := firstNonEmpty(channel.CategoryID, slug(channel.Category), "live-tv")
+		name := firstNonEmpty(channel.Category, channel.CategoryName, "Live TV")
+		key := strings.ToLower(id)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		categories = append(categories, xtreamLiveCategory{
+			CategoryID:   id,
+			CategoryName: name,
+		})
+	}
+	sort.SliceStable(categories, func(i, j int) bool {
+		return categories[i].CategoryName < categories[j].CategoryName
+	})
+	return categories
 }
 
 func (s *appState) searchManifestItems(ctx context.Context, query string, mediaType string, limit int) []vortexoHomeItem {
@@ -1113,7 +1493,11 @@ func (s *appState) handleXtreamPlayerAPI(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		respondJSON(w, http.StatusOK, xtreamSeriesInfoFromStremio(meta))
-	case "get_vod_streams", "get_series", "get_vod_categories", "get_series_categories", "get_live_categories":
+	case "get_live_streams":
+		respondJSON(w, http.StatusOK, s.collectLiveChannels(r.Context(), 1000))
+	case "get_live_categories":
+		respondJSON(w, http.StatusOK, liveCategoriesFromChannels(s.collectLiveChannels(r.Context(), 1000)))
+	case "get_vod_streams", "get_series", "get_vod_categories", "get_series_categories":
 		respondJSON(w, http.StatusOK, []any{})
 	default:
 		respondJSON(w, http.StatusOK, []any{})
@@ -2355,6 +2739,60 @@ func manifestSupportsType(manifest stremioManifest, wanted string) bool {
 	return false
 }
 
+func isLiveCatalog(manifest stremioManifest, item installedManifest, catalog stremioCatalog) bool {
+	rawType := strings.ToLower(strings.TrimSpace(catalog.Type))
+	switch rawType {
+	case "channel", "channels", "live", "live-tv", "livetv", "iptv":
+		return true
+	case "tv":
+		text := strings.ToLower(strings.Join([]string{
+			manifest.ID,
+			manifest.Name,
+			item.Name,
+			catalog.ID,
+			catalog.Name,
+		}, " "))
+		return strings.Contains(text, "live") ||
+			strings.Contains(text, "iptv") ||
+			strings.Contains(text, "channel") ||
+			manifestHasRawType(manifest, "tv")
+	default:
+		return false
+	}
+}
+
+func manifestHasRawType(manifest stremioManifest, wanted string) bool {
+	wanted = strings.ToLower(strings.TrimSpace(wanted))
+	if wanted == "" {
+		return false
+	}
+	for _, raw := range manifest.Types {
+		if strings.ToLower(strings.TrimSpace(raw)) == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func liveStreamTypes(catalogType string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	add(catalogType)
+	add("channel")
+	add("tv")
+	add("live")
+	add("iptv")
+	return out
+}
+
 func catalogSupportsSearch(catalog stremioCatalog) bool {
 	if len(catalog.Extra) == 0 {
 		return true
@@ -2647,6 +3085,38 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func absoluteAddonURL(raw string, base string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(raw); err == nil && parsed.IsAbs() {
+		return raw
+	}
+	if strings.HasPrefix(raw, "/") && strings.TrimSpace(base) != "" {
+		return strings.TrimRight(base, "/") + raw
+	}
+	return raw
+}
+
+func commaSet(raw string) map[string]bool {
+	out := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out[part] = true
+		}
+	}
+	return out
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func boundedInt(raw string, fallback, min, max int) int {
