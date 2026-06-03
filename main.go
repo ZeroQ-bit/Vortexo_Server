@@ -128,9 +128,16 @@ type stremioManifest struct {
 }
 
 type stremioCatalog struct {
-	Type string `json:"type"`
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	Type  string                `json:"type"`
+	ID    string                `json:"id"`
+	Name  string                `json:"name"`
+	Extra []stremioCatalogExtra `json:"extra"`
+}
+
+type stremioCatalogExtra struct {
+	Name       string   `json:"name"`
+	IsRequired bool     `json:"isRequired"`
+	Options    []string `json:"options"`
 }
 
 type stremioCatalogResponse struct {
@@ -397,6 +404,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/movies/", s.handleMovieByID)
 	mux.HandleFunc("/api/v1/series", s.handleSeries)
 	mux.HandleFunc("/api/v1/series/", s.handleSeriesByID)
+	mux.HandleFunc("/api/v1/search", s.handleSearch)
 	mux.HandleFunc("/api/v1/stats", s.handleStats)
 	mux.HandleFunc("/api/v1/channels", s.handleEmptyList)
 	mux.HandleFunc("/api/v1/channels/", s.handleEmptyList)
@@ -791,6 +799,22 @@ func (s *appState) handleSeries(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *appState) handleSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	query := strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("query"), r.URL.Query().Get("q")))
+	if len(query) < 2 {
+		respondJSON(w, http.StatusOK, map[string]any{"items": []vortexoHomeItem{}, "results": []vortexoHomeItem{}})
+		return
+	}
+	limit := boundedInt(r.URL.Query().Get("limit"), 60, 1, 100)
+	mediaType := normalizeCatalogType(r.URL.Query().Get("media_type"))
+	items := s.searchManifestItems(r.Context(), query, mediaType, limit)
+	respondJSON(w, http.StatusOK, map[string]any{"items": items, "results": items})
+}
+
 func (s *appState) handleDiscoverList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -922,6 +946,61 @@ func (s *appState) collectManifestItems(ctx context.Context, mediaType string, l
 					skip--
 					continue
 				}
+				collected = append(collected, homeItem)
+				if len(collected) >= limit {
+					break
+				}
+			}
+		}
+	}
+
+	return collected
+}
+
+func (s *appState) searchManifestItems(ctx context.Context, query string, mediaType string, limit int) []vortexoHomeItem {
+	installed := s.enabledManifests()
+	seen := map[string]bool{}
+	collected := make([]vortexoHomeItem, 0, limit)
+	normalizedQuery := strings.ToLower(strings.TrimSpace(query))
+
+	for _, item := range installed {
+		if len(collected) >= limit {
+			break
+		}
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			log.Printf("search manifest %s failed: %v", item.URL, err)
+			continue
+		}
+		if !manifestSupportsResource(manifest, "catalog") {
+			continue
+		}
+		for _, catalog := range manifest.Catalogs {
+			if len(collected) >= limit {
+				break
+			}
+			catalogType := normalizeCatalogType(catalog.Type)
+			if catalogType == "" || (mediaType != "" && catalogType != mediaType) {
+				continue
+			}
+			if !catalogSupportsSearch(catalog) {
+				continue
+			}
+			items, err := s.fetchCatalogSearch(ctx, base, catalog, query, limit*2)
+			if err != nil {
+				log.Printf("search catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
+				continue
+			}
+			for _, meta := range items {
+				homeItem := homeItemFromStremio(meta, catalogType)
+				if !homeItemMatchesSearch(homeItem, normalizedQuery) {
+					continue
+				}
+				key := homeDedupeKey(homeItem)
+				if key == "" || seen[key] {
+					continue
+				}
+				seen[key] = true
 				collected = append(collected, homeItem)
 				if len(collected) >= limit {
 					break
@@ -1206,7 +1285,19 @@ func (s *appState) fetchManifest(ctx context.Context, rawURL string, force bool)
 }
 
 func (s *appState) fetchCatalog(ctx context.Context, base string, catalog stremioCatalog, limit int) ([]stremioMeta, error) {
-	u := fmt.Sprintf("%s/catalog/%s/%s.json", strings.TrimRight(base, "/"), url.PathEscape(catalog.Type), url.PathEscape(catalog.ID))
+	return s.fetchCatalogExtra(ctx, base, catalog, "", limit)
+}
+
+func (s *appState) fetchCatalogSearch(ctx context.Context, base string, catalog stremioCatalog, query string, limit int) ([]stremioMeta, error) {
+	return s.fetchCatalogExtra(ctx, base, catalog, "search="+query, limit)
+}
+
+func (s *appState) fetchCatalogExtra(ctx context.Context, base string, catalog stremioCatalog, extra string, limit int) ([]stremioMeta, error) {
+	path := fmt.Sprintf("%s/catalog/%s/%s", strings.TrimRight(base, "/"), url.PathEscape(catalog.Type), url.PathEscape(catalog.ID))
+	if strings.TrimSpace(extra) != "" {
+		path += "/" + url.PathEscape(extra)
+	}
+	u := path + ".json"
 	var response stremioCatalogResponse
 	if err := s.getJSON(ctx, u, &response); err != nil {
 		return nil, err
@@ -2264,6 +2355,18 @@ func manifestSupportsType(manifest stremioManifest, wanted string) bool {
 	return false
 }
 
+func catalogSupportsSearch(catalog stremioCatalog) bool {
+	if len(catalog.Extra) == 0 {
+		return true
+	}
+	for _, extra := range catalog.Extra {
+		if strings.EqualFold(strings.TrimSpace(extra.Name), "search") {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeManifestURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -2474,6 +2577,34 @@ func homeDedupeKey(item vortexoHomeItem) string {
 		return item.MediaType + ":imdb:" + strings.ToLower(item.IMDBID)
 	}
 	return item.MediaType + ":" + slug(item.Title+"-"+strconv.Itoa(item.Year))
+}
+
+func homeItemMatchesSearch(item vortexoHomeItem, normalizedQuery string) bool {
+	normalizedQuery = strings.TrimSpace(strings.ToLower(normalizedQuery))
+	if normalizedQuery == "" {
+		return true
+	}
+	haystack := strings.ToLower(strings.Join([]string{
+		item.Title,
+		item.OriginalTitle,
+		item.Overview,
+		item.IMDBID,
+		strconv.Itoa(item.Year),
+		strings.Join(item.Genres, " "),
+	}, " "))
+	if strings.Contains(haystack, normalizedQuery) {
+		return true
+	}
+	terms := strings.Fields(normalizedQuery)
+	if len(terms) == 0 {
+		return true
+	}
+	for _, term := range terms {
+		if !strings.Contains(haystack, term) {
+			return false
+		}
+	}
+	return true
 }
 
 func randomToken() string {
