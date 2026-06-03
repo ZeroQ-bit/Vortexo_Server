@@ -1,0 +1,17 @@
+services:
+  vortexo-manifest-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vortexo-manifest-server:latest
+    container_name: vortexo-manifest-server
+    restart: unless-stopped
+    ports:
+      - "18456:8080"
+    environment:
+      VORTEXO_LISTEN_ADDR: ":8080"
+      VORTEXO_DATA_DIR: "/data"
+      VORTEXO_ADMIN_USERNAME: "${VORTEXO_ADMIN_USERNAME:-vortexo}"
+      VORTEXO_ADMIN_PASSWORD: "${VORTEXO_ADMIN_PASSWORD:-vortexo}"
+    volumes:
+      - ./data:/data

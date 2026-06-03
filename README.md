@@ -1,50 +1,166 @@
-# Vortexo Server
+# Vortexo Manifest Server
 
-Vortexo Server is a self-hosted companion backend for the Vortexo Apple TV app.
+Vortexo Manifest Server is the self-hosted companion server for the Vortexo Apple TV app. It lets you install Stremio-compatible manifest URLs on your own server, then Vortexo reads the server as a single configured source.
 
-It provides a simple first-run setup wizard that lets users install and manage manifest URLs for catalog metadata and playback sources. Vortexo Apple TV can then connect to this server and use those manifests for Home rows, metadata, and stream/source lookup.
+The server stores your installed manifest URLs and local configuration. It does not bundle add-ons, content, debrid accounts, fallback API keys, or paid service credentials.
 
-## What it does
+## What It Provides
 
-Vortexo Server helps turn a clean server into a working Vortexo backend.
+- Manifest-based catalog rows for Vortexo Home.
+- Movie, show, season, and episode metadata from installed catalog manifests.
+- Stream lookup from installed stream manifests.
+- Optional subtitle lookups from installed subtitle manifests.
+- Optional Live TV manifests when supported by the installed add-on.
+- Optional watch state and Up Next rows from Trakt and Plex imports.
+- A browser setup wizard for installing and managing manifests.
 
-It supports:
+Vortexo Pro is required in the Apple TV app to use manifest-server features.
 
-- AIOMetadata-style catalog manifests
-- AIOStreams-style stream manifests
-- Debrid-backed playback sources
-- Real-Debrid, TorBox, Premiumize, AllDebrid, and other providers supported by your AIOStreams instance
-- Optional TMDB, TVDB, Gemini, and RPDB configuration
-- Easy Apple TV connection using one server URL
-- Installed manifest management
+## Quick Start With Docker Compose
 
-## How it works
+Clone the repo:
 
-1. Sign in to Vortexo Server.
-2. Prepare your accounts and optional API keys.
-3. Create or paste your catalog manifest URL.
-4. Create or paste your stream manifest URL.
-5. Install the manifests into Vortexo Server.
-6. Open Vortexo Apple TV.
-7. Go to Settings → Servers.
-8. Enable Vortexo Server and connect using your server URL.
+```bash
+git clone https://github.com/ZeroQ-bit/Vortexo-Manifest-Server.git
+cd Vortexo-Manifest-Server
+```
 
-## Privacy
+Create your local environment file:
 
-Vortexo Server stores only the installed manifest URLs.
+```bash
+cp .env.example .env
+```
 
-Debrid, TMDB, TVDB, Gemini, and RPDB keys stay inside the upstream addon configurations you create. Vortexo Server does not need to store those keys directly.
+Edit `.env` and choose a password:
 
-## Catalogs
+```env
+VORTEXO_ADMIN_USERNAME=vortexo
+VORTEXO_ADMIN_PASSWORD=change-this-password
+```
 
-Catalog manifests are used by Vortexo Apple TV to create landscape Home rows and metadata-driven browsing sections.
+Start the server:
 
-## Playback
+```bash
+docker compose up -d --build
+```
 
-Stream manifests are used by Vortexo Apple TV for source lookup when opening movies and episodes.
+Open the dashboard:
 
-If a manifest returns only torrent hashes, those sources are skipped until a debrid-backed playable URL is returned.
+```text
+http://<your-server-ip>:18456
+```
 
-## Project status
+For example:
 
-This project is in early development. Features, setup steps, and behavior may change as Vortexo Server improves.
+```text
+http://192.168.1.63:18456
+```
+
+Do not use `localhost` in the Apple TV app unless the server is actually running on the Apple TV simulator host. For a real Apple TV, use the LAN IP address of the machine running Docker.
+
+## Apple TV Setup
+
+1. Open the Vortexo Manifest Server dashboard in a browser.
+2. Sign in with the admin username and password from `.env`.
+3. Install your catalog, stream, subtitle, Live TV, Trakt, or Plex manifests.
+4. Open Vortexo on Apple TV.
+5. Go to `Settings` > `Vortexo Server`.
+6. Set the server URL to:
+
+```text
+http://<your-server-ip>:18456
+```
+
+7. Enter the same dashboard username and password.
+8. Select `Connect Vortexo Server`.
+
+After this, Vortexo can load manifest-powered Home rows, metadata, streams, subtitles, Live TV, and Continue Watching where those features are available from your installed manifests and account connections.
+
+## Docker Run
+
+If you do not want to use Compose:
+
+```bash
+docker build -t vortexo-manifest-server:latest .
+docker run -d \
+  --name vortexo-manifest-server \
+  --restart unless-stopped \
+  -p 18456:8080 \
+  -e VORTEXO_ADMIN_USERNAME=vortexo \
+  -e VORTEXO_ADMIN_PASSWORD=change-this-password \
+  -v "$(pwd)/data:/data" \
+  vortexo-manifest-server:latest
+```
+
+Open:
+
+```text
+http://<your-server-ip>:18456
+```
+
+## Updating
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Your installed manifests and settings are stored in `./data`, so normal rebuilds keep your setup.
+
+## Data And Backups
+
+The container stores persistent data in:
+
+```text
+./data
+```
+
+Back up this folder if you want to keep installed manifests, credentials, watch state, and setup progress.
+
+## Environment Variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `VORTEXO_LISTEN_ADDR` | `:8080` | Address and port used inside the container. |
+| `VORTEXO_DATA_DIR` | `/data` | Directory for persistent server data. |
+| `VORTEXO_ADMIN_USERNAME` | `vortexo` | Admin username used on first run. |
+| `VORTEXO_ADMIN_PASSWORD` | `vortexo` | Admin password used on first run. |
+| `PORT` | unset | Alternative port variable. Used only if `VORTEXO_LISTEN_ADDR` is not set. |
+| `DATA_DIR` | unset | Alternative data directory variable. Used only if `VORTEXO_DATA_DIR` is not set. |
+
+The admin username and password environment variables seed the first saved configuration. If you already started the server once, changing `.env` may not change the saved admin login. To reset the server, stop the container and remove or edit the saved data in `./data`.
+
+## Health Check
+
+The Docker image includes a health check:
+
+```text
+http://127.0.0.1:8080/api/v1/health
+```
+
+From another machine on your LAN, use:
+
+```text
+http://<your-server-ip>:18456/api/v1/health
+```
+
+## Troubleshooting
+
+If the browser says connection refused, check that the container is running:
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+If Apple TV cannot connect, confirm the server URL uses the Docker host LAN IP and port `18456`.
+
+If Home rows are empty, sign in to the dashboard and install at least one catalog manifest. Stream playback also needs a stream manifest.
+
+If streams are visible but locked in Vortexo, make sure Vortexo Pro is active in the Apple TV app.
+
+If credentials do not change after editing `.env`, remember that the environment variables are only used for the first saved configuration.
+
+## Security
+
+Run this server on a trusted network. Choose a strong admin password. Do not expose it directly to the public internet unless you understand how to put it behind HTTPS, authentication, and a secure reverse proxy.

@@ -1,0 +1,8 @@
+.git
+.github
+data
+*.log
+*.tmp
+*.swp
+.DS_Store
+docker-compose*.yml
