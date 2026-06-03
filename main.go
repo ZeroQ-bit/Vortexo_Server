@@ -518,10 +518,11 @@ type traktShow struct {
 }
 
 type traktEpisode struct {
-	Season int      `json:"season"`
-	Number int      `json:"number"`
-	Title  string   `json:"title"`
-	IDs    traktIDs `json:"ids"`
+	Season     int       `json:"season"`
+	Number     int       `json:"number"`
+	Title      string    `json:"title"`
+	IDs        traktIDs  `json:"ids"`
+	FirstAired time.Time `json:"first_aired"`
 }
 
 type traktWatchedMovie struct {
@@ -559,6 +560,13 @@ type traktPlaybackEpisode struct {
 	PausedAt time.Time    `json:"paused_at"`
 	Show     traktShow    `json:"show"`
 	Episode  traktEpisode `json:"episode"`
+}
+
+type traktShowProgress struct {
+	Aired         int           `json:"aired"`
+	Completed     int           `json:"completed"`
+	LastWatchedAt time.Time     `json:"last_watched_at"`
+	NextEpisode   *traktEpisode `json:"next_episode"`
 }
 
 type plexHistoryResponse struct {
@@ -1968,6 +1976,44 @@ func (s *appState) upsertWatchStateItems(items []watchStateItem) error {
 	return s.saveWatchStateLocked()
 }
 
+func (s *appState) pruneStaleTraktUpNextItems(activeKeys map[string]bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.watchState.Items) == 0 {
+		return nil
+	}
+
+	filtered := s.watchState.Items[:0]
+	changed := false
+	for _, item := range s.watchState.Items {
+		key := watchStateKey(item)
+		isUpNext := strings.Contains(strings.ToLower(item.Source), "trakt-up-next")
+		isBareUpNext := isUpNext && !item.Watched && item.ProgressPercent <= 0 && item.ProgressSeconds <= 0
+		if isBareUpNext && !activeKeys[key] {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	if !changed {
+		return nil
+	}
+	s.watchState.Items = filtered
+	return s.saveWatchStateLocked()
+}
+
+func watchStateKeySet(items []watchStateItem) map[string]bool {
+	keys := make(map[string]bool, len(items))
+	for _, item := range items {
+		key := watchStateKey(item)
+		if key != "" {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
 func (s *appState) createTraktDeviceCode(ctx context.Context) (traktDeviceCodeResponse, error) {
 	s.mu.RLock()
 	clientID := strings.TrimSpace(s.config.Watch.Trakt.ClientID)
@@ -2072,7 +2118,9 @@ func (s *appState) syncTraktWatchState(ctx context.Context) ([]watchStateItem, e
 		return nil, err
 	}
 
-	items := make([]watchStateItem, 0, len(watchedMovies)+len(playbackMovies)+len(playbackEpisodes))
+	upNextEpisodes := s.traktUpNextWatchItems(ctx, watchedShows)
+
+	items := make([]watchStateItem, 0, len(watchedMovies)+len(playbackMovies)+len(playbackEpisodes)+len(upNextEpisodes))
 	for _, entry := range watchedMovies {
 		items = append(items, watchItemFromTraktMovie(entry.Movie, true, entry.LastWatchedAt, 0, entry.Plays))
 	}
@@ -2093,8 +2141,12 @@ func (s *appState) syncTraktWatchState(ctx context.Context) ([]watchStateItem, e
 	for _, entry := range playbackEpisodes {
 		items = append(items, watchItemFromTraktEpisode(entry.Show, entry.Episode, entry.Progress >= 90, entry.PausedAt, entry.Progress, 0))
 	}
+	items = append(items, upNextEpisodes...)
 
 	if err := s.upsertWatchStateItems(items); err != nil {
+		return nil, err
+	}
+	if err := s.pruneStaleTraktUpNextItems(watchStateKeySet(upNextEpisodes)); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -2105,6 +2157,61 @@ func (s *appState) syncTraktWatchState(ctx context.Context) ([]watchStateItem, e
 		return nil, err
 	}
 	return items, nil
+}
+
+func (s *appState) traktUpNextWatchItems(ctx context.Context, watchedShows []traktWatchedShow) []watchStateItem {
+	const maxShows = 100
+
+	shows := append([]traktWatchedShow(nil), watchedShows...)
+	sort.SliceStable(shows, func(i, j int) bool {
+		return shows[i].LastWatchedAt.After(shows[j].LastWatchedAt)
+	})
+	if len(shows) > maxShows {
+		shows = shows[:maxShows]
+	}
+
+	now := time.Now().UTC()
+	items := make([]watchStateItem, 0, len(shows))
+	seen := make(map[string]bool, len(shows))
+	for _, entry := range shows {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		showID := traktShowAPIID(entry.Show)
+		if showID == "" {
+			continue
+		}
+
+		var progress traktShowProgress
+		path := "/shows/" + url.PathEscape(showID) + "/progress/watched?hidden=false&specials=false&count_specials=false&extended=full"
+		if err := s.traktGetJSON(ctx, path, &progress); err != nil {
+			log.Printf("Trakt up next skipped %q: %v", firstNonEmpty(entry.Show.Title, showID), err)
+			continue
+		}
+		if progress.NextEpisode == nil {
+			continue
+		}
+		episode := *progress.NextEpisode
+		if episode.Season <= 0 || episode.Number <= 0 {
+			continue
+		}
+		if !episode.FirstAired.IsZero() && episode.FirstAired.After(now.Add(6*time.Hour)) {
+			continue
+		}
+
+		updatedAt := maxTime(progress.LastWatchedAt, entry.LastWatchedAt)
+		if updatedAt.IsZero() {
+			updatedAt = now
+		}
+		item := watchItemFromTraktUpNextEpisode(entry.Show, episode, updatedAt)
+		key := watchStateKey(item)
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		items = append(items, item)
+	}
+	return items
 }
 
 func (s *appState) traktGetJSON(ctx context.Context, path string, target any) error {
@@ -3792,6 +3899,28 @@ func watchItemFromTraktEpisode(show traktShow, episode traktEpisode, watched boo
 	}
 	item.ID = watchStateKey(item)
 	return item
+}
+
+func watchItemFromTraktUpNextEpisode(show traktShow, episode traktEpisode, updatedAt time.Time) watchStateItem {
+	item := watchItemFromTraktEpisode(show, episode, false, updatedAt, 0, 0)
+	item.Source = "trakt-up-next"
+	item.Watched = false
+	item.WatchedAt = time.Time{}
+	item.ProgressPercent = 0
+	item.ProgressSeconds = 0
+	item.DurationSeconds = 0
+	item.ID = watchStateKey(item)
+	return item
+}
+
+func traktShowAPIID(show traktShow) string {
+	if id := strings.TrimSpace(show.IDs.Slug); id != "" {
+		return id
+	}
+	if show.IDs.Trakt > 0 {
+		return strconv.Itoa(show.IDs.Trakt)
+	}
+	return strings.TrimSpace(show.IDs.IMDB)
 }
 
 func decodePlexHistory(data []byte) ([]plexMetadata, error) {
