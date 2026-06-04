@@ -26,9 +26,10 @@ import (
 )
 
 const (
-	defaultListenAddr = ":8080"
-	defaultUsername   = "vortexo"
-	defaultPassword   = "vortexo"
+	defaultListenAddr  = ":8080"
+	defaultUsername    = "vortexo"
+	defaultPassword    = "vortexo"
+	defaultRegistryURL = "https://stremio-addons.net/api/manifest.json"
 )
 
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
@@ -43,11 +44,13 @@ type appState struct {
 }
 
 type bridgeConfig struct {
-	AdminUsername string              `json:"admin_username"`
-	AdminPassword string              `json:"admin_password"`
-	AuthToken     string              `json:"auth_token"`
-	Manifests     []installedManifest `json:"manifests"`
-	Watch         watchSyncConfig     `json:"watch,omitempty"`
+	AdminUsername    string              `json:"admin_username"`
+	AdminPassword    string              `json:"admin_password"`
+	AuthToken        string              `json:"auth_token"`
+	AddonRegistryURL string              `json:"addon_registry_url,omitempty"`
+	Manifests        []installedManifest `json:"manifests"`
+	Catalogs         []catalogPreference `json:"catalogs,omitempty"`
+	Watch            watchSyncConfig     `json:"watch,omitempty"`
 }
 
 type watchSyncConfig struct {
@@ -79,6 +82,17 @@ type installedManifest struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type catalogPreference struct {
+	Key         string    `json:"key"`
+	ManifestID  string    `json:"manifest_id"`
+	CatalogType string    `json:"catalog_type"`
+	CatalogID   string    `json:"catalog_id"`
+	Name        string    `json:"name,omitempty"`
+	Enabled     bool      `json:"enabled"`
+	SortOrder   int       `json:"sort_order"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 type dashboardManifest struct {
 	ID           string                     `json:"id"`
 	Name         string                     `json:"name"`
@@ -98,9 +112,15 @@ type dashboardManifest struct {
 }
 
 type dashboardManifestCatalog struct {
+	Key            string   `json:"key"`
+	ManifestID     string   `json:"manifest_id"`
+	ManifestName   string   `json:"manifest_name"`
 	Type           string   `json:"type"`
 	ID             string   `json:"id"`
 	Name           string   `json:"name"`
+	OriginalName   string   `json:"original_name"`
+	Enabled        bool     `json:"enabled"`
+	SortOrder      int      `json:"sort_order"`
 	Search         bool     `json:"search"`
 	RequiredExtras []string `json:"required_extras,omitempty"`
 	OptionalExtras []string `json:"optional_extras,omitempty"`
@@ -169,14 +189,61 @@ type manifestCacheEntry struct {
 }
 
 type stremioManifest struct {
-	ID          string           `json:"id"`
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
-	Version     string           `json:"version"`
-	Logo        string           `json:"logo"`
-	Resources   []any            `json:"resources"`
-	Types       []string         `json:"types"`
-	Catalogs    []stremioCatalog `json:"catalogs"`
+	ID            string           `json:"id"`
+	Name          string           `json:"name"`
+	Description   string           `json:"description"`
+	Version       string           `json:"version"`
+	Logo          string           `json:"logo"`
+	Resources     []any            `json:"resources"`
+	Types         []string         `json:"types"`
+	Catalogs      []stremioCatalog `json:"catalogs"`
+	AddonCatalogs []stremioCatalog `json:"addonCatalogs"`
+	BehaviorHints any              `json:"behaviorHints"`
+}
+
+type addonCatalogResponse struct {
+	Addons []addonCatalogEntry `json:"addons"`
+	Items  []addonCatalogEntry `json:"items"`
+	Metas  []addonCatalogEntry `json:"metas"`
+}
+
+type addonCatalogEntry struct {
+	TransportURL  string          `json:"transportUrl"`
+	TransportName string          `json:"transportName"`
+	URL           string          `json:"url"`
+	ID            string          `json:"id"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description"`
+	Logo          string          `json:"logo"`
+	Version       string          `json:"version"`
+	Manifest      stremioManifest `json:"manifest"`
+}
+
+type dashboardAddon struct {
+	ID                    string                     `json:"id"`
+	Name                  string                     `json:"name"`
+	Description           string                     `json:"description,omitempty"`
+	Version               string                     `json:"version,omitempty"`
+	Logo                  string                     `json:"logo,omitempty"`
+	URL                   string                     `json:"url"`
+	ConfigURL             string                     `json:"config_url,omitempty"`
+	TransportName         string                     `json:"transport_name,omitempty"`
+	Installed             bool                       `json:"installed"`
+	Configurable          bool                       `json:"configurable"`
+	ConfigurationRequired bool                       `json:"configuration_required"`
+	Resources             []string                   `json:"resources"`
+	Types                 []string                   `json:"types"`
+	Capabilities          []string                   `json:"capabilities"`
+	Catalogs              []dashboardManifestCatalog `json:"catalogs"`
+}
+
+type manifestCatalogEntry struct {
+	Item     installedManifest
+	Manifest stremioManifest
+	Base     string
+	Catalog  stremioCatalog
+	Pref     catalogPreference
+	Order    int
 }
 
 type stremioCatalog struct {
@@ -694,6 +761,8 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/auth/verify", s.requireAuth(s.handleVerify))
 	mux.HandleFunc("/api/v1/settings", s.handleSettings)
 	mux.HandleFunc("/api/v1/bridge/dashboard", s.requireAuth(s.handleBridgeDashboard))
+	mux.HandleFunc("/api/v1/bridge/addon-registry", s.requireAuth(s.handleAddonRegistry))
+	mux.HandleFunc("/api/v1/bridge/catalogs", s.requireAuth(s.handleCatalogPreferences))
 	mux.HandleFunc("/api/v1/bridge/perfect-setup", s.requireAuth(s.handlePerfectSetup))
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
@@ -749,8 +818,16 @@ func (s *appState) load() error {
 		s.config.AuthToken = randomToken()
 		changed = true
 	}
+	if s.config.AddonRegistryURL == "" {
+		s.config.AddonRegistryURL = defaultRegistryURL
+		changed = true
+	}
 	if s.config.Manifests == nil {
 		s.config.Manifests = []installedManifest{}
+		changed = true
+	}
+	if s.config.Catalogs == nil {
+		s.config.Catalogs = []catalogPreference{}
 		changed = true
 	}
 	for i := range s.config.Manifests {
@@ -813,7 +890,7 @@ func (s *appState) saveWatchStateLocked() error {
 func (s *appState) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -1130,12 +1207,16 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 
 	s.mu.RLock()
 	installed := append([]installedManifest(nil), s.config.Manifests...)
+	prefs := catalogPreferenceMapLocked(s.config.Catalogs)
+	registryURL := firstNonEmpty(s.config.AddonRegistryURL, defaultRegistryURL)
 	watch := s.config.Watch
 	watchCount := len(s.watchState.Items)
 	watchUpdatedAt := s.watchState.UpdatedAt
 	s.mu.RUnlock()
 
 	manifests := make([]dashboardManifest, 0, len(installed))
+	allCatalogs := make([]dashboardManifestCatalog, 0)
+	catalogOrder := 0
 	for _, item := range installed {
 		entry := dashboardManifest{
 			ID:        item.ID,
@@ -1170,16 +1251,21 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 		entry.Resources = manifestResourceNames(manifest)
 		entry.Types = append([]string(nil), manifest.Types...)
 		entry.Capabilities = manifestCapabilities(manifest)
-		entry.Catalogs = dashboardCatalogs(manifest)
+		entry.Catalogs = dashboardCatalogs(item, manifest, prefs, catalogOrder)
+		catalogOrder += len(manifest.Catalogs)
+		allCatalogs = append(allCatalogs, entry.Catalogs...)
 		manifests = append(manifests, entry)
 	}
+	sortDashboardCatalogs(allCatalogs)
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"server": map[string]any{
 			"name": "Vortexo Add-on Server",
 			"time": time.Now().UTC(),
 		},
-		"manifests": manifests,
+		"manifests":    manifests,
+		"catalogs":     allCatalogs,
+		"registry_url": registryURL,
 		"watch": map[string]any{
 			"count":               watchCount,
 			"updated_at":          watchUpdatedAt,
@@ -1191,6 +1277,163 @@ func (s *appState) handleBridgeDashboard(w http.ResponseWriter, r *http.Request)
 			"trakt_client_config": watch.Trakt.ClientID != "",
 		},
 	})
+}
+
+func (s *appState) handleAddonRegistry(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.RLock()
+		registryURL := firstNonEmpty(s.config.AddonRegistryURL, defaultRegistryURL)
+		installed := append([]installedManifest(nil), s.config.Manifests...)
+		s.mu.RUnlock()
+
+		if override := strings.TrimSpace(r.URL.Query().Get("registry_url")); override != "" {
+			registryURL = normalizeManifestURL(override)
+		}
+		registryURL = normalizeManifestURL(registryURL)
+		if registryURL == "" {
+			respondError(w, http.StatusBadRequest, "registry URL is invalid")
+			return
+		}
+
+		query := strings.TrimSpace(r.URL.Query().Get("q"))
+		capability := strings.TrimSpace(r.URL.Query().Get("capability"))
+		mediaType := strings.TrimSpace(r.URL.Query().Get("type"))
+		limit := boundedInt(r.URL.Query().Get("limit"), 80, 1, 250)
+
+		manifest, base, err := s.fetchManifest(r.Context(), registryURL, false)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, "add-on registry failed: "+err.Error())
+			return
+		}
+
+		catalogs := manifest.AddonCatalogs
+		if len(catalogs) == 0 {
+			catalogs = manifest.Catalogs
+		}
+		installedURLs := installedManifestURLSet(installed)
+		addons := make([]dashboardAddon, 0, limit)
+		seen := map[string]bool{}
+		for _, catalog := range catalogs {
+			if len(addons) >= limit {
+				break
+			}
+			entries, err := s.fetchAddonCatalog(r.Context(), base, catalog, limit*2)
+			if err != nil {
+				log.Printf("add-on registry catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
+				continue
+			}
+			for _, entry := range entries {
+				addon := dashboardAddonFromEntry(entry, installedURLs)
+				if addon.URL == "" || addon.Name == "" {
+					continue
+				}
+				key := strings.ToLower(addon.URL)
+				if seen[key] {
+					continue
+				}
+				if !addonMatchesFilters(addon, query, capability, mediaType) {
+					continue
+				}
+				seen[key] = true
+				addons = append(addons, addon)
+				if len(addons) >= limit {
+					break
+				}
+			}
+		}
+		sort.SliceStable(addons, func(i, j int) bool {
+			if addons[i].Installed != addons[j].Installed {
+				return addons[i].Installed
+			}
+			return strings.ToLower(addons[i].Name) < strings.ToLower(addons[j].Name)
+		})
+		respondJSON(w, http.StatusOK, map[string]any{
+			"registry_url": registryURL,
+			"addons":       addons,
+		})
+	case http.MethodPost:
+		var req struct {
+			RegistryURL string `json:"registry_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		registryURL := normalizeManifestURL(firstNonEmpty(req.RegistryURL, defaultRegistryURL))
+		if registryURL == "" {
+			respondError(w, http.StatusBadRequest, "registry URL is invalid")
+			return
+		}
+		if _, _, err := s.fetchManifest(r.Context(), registryURL, true); err != nil {
+			respondError(w, http.StatusBadGateway, "registry validation failed: "+err.Error())
+			return
+		}
+		s.mu.Lock()
+		s.config.AddonRegistryURL = registryURL
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save registry URL")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true, "registry_url": registryURL})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *appState) handleCatalogPreferences(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		respondJSON(w, http.StatusOK, map[string]any{"catalogs": s.dashboardCatalogs(r.Context())})
+	case http.MethodPost:
+		var req struct {
+			Catalogs []catalogPreference `json:"catalogs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		now := time.Now().UTC()
+		next := make([]catalogPreference, 0, len(req.Catalogs))
+		seen := map[string]bool{}
+		for _, item := range req.Catalogs {
+			key := strings.TrimSpace(item.Key)
+			if key == "" {
+				key = catalogKey(item.ManifestID, item.CatalogType, item.CatalogID)
+			}
+			if key == "" || seen[key] {
+				continue
+			}
+			manifestID, catalogType, catalogID := splitCatalogKey(key)
+			item.Key = key
+			item.ManifestID = firstNonEmpty(strings.TrimSpace(item.ManifestID), manifestID)
+			item.CatalogType = firstNonEmpty(strings.TrimSpace(item.CatalogType), catalogType)
+			item.CatalogID = firstNonEmpty(strings.TrimSpace(item.CatalogID), catalogID)
+			item.Name = strings.TrimSpace(item.Name)
+			item.UpdatedAt = now
+			seen[key] = true
+			next = append(next, item)
+		}
+		sort.SliceStable(next, func(i, j int) bool {
+			if next[i].SortOrder != next[j].SortOrder {
+				return next[i].SortOrder < next[j].SortOrder
+			}
+			return next[i].Key < next[j].Key
+		})
+		s.mu.Lock()
+		s.config.Catalogs = next
+		err := s.saveLocked()
+		s.mu.Unlock()
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save catalogs")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true, "catalogs": s.dashboardCatalogs(r.Context())})
+	default:
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func (s *appState) handlePerfectSetup(w http.ResponseWriter, r *http.Request) {
@@ -1302,6 +1545,49 @@ func (s *appState) handleManifestByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.Method {
+	case http.MethodPut, http.MethodPatch:
+		var req struct {
+			Name    *string `json:"name"`
+			Enabled *bool   `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		s.mu.Lock()
+		found := false
+		var updated installedManifest
+		for i := range s.config.Manifests {
+			if s.config.Manifests[i].ID != id {
+				continue
+			}
+			found = true
+			if req.Name != nil {
+				if name := strings.TrimSpace(*req.Name); name != "" {
+					s.config.Manifests[i].Name = name
+				}
+			}
+			if req.Enabled != nil {
+				s.config.Manifests[i].Enabled = *req.Enabled
+			}
+			s.config.Manifests[i].UpdatedAt = time.Now().UTC()
+			updated = s.config.Manifests[i]
+			break
+		}
+		var err error
+		if found {
+			err = s.saveLocked()
+		}
+		s.mu.Unlock()
+		if !found {
+			respondError(w, http.StatusNotFound, "manifest not found")
+			return
+		}
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to save manifest")
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"manifest": updated})
 	case http.MethodDelete:
 		s.mu.Lock()
 		next := s.config.Manifests[:0]
@@ -1314,6 +1600,7 @@ func (s *appState) handleManifestByID(w http.ResponseWriter, r *http.Request) {
 			next = append(next, item)
 		}
 		s.config.Manifests = next
+		s.config.Catalogs = removeManifestCatalogPreferences(s.config.Catalogs, id)
 		err := s.saveLocked()
 		s.mu.Unlock()
 		if err != nil {
@@ -1549,58 +1836,51 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 	rowLimit := boundedInt(r.URL.Query().Get("row_limit"), 8, 1, 12)
 	itemLimit := boundedInt(r.URL.Query().Get("item_limit"), 30, 6, 50)
 
-	installed := s.enabledManifests()
+	entries := s.enabledCatalogEntries(r.Context())
 	rows := make([]vortexoHomeRow, 0, rowLimit)
 	used := map[string]bool{}
 	now := time.Now().UTC()
 
-	for _, item := range installed {
+	for _, entry := range entries {
 		if len(rows) >= rowLimit {
 			break
 		}
-		manifest, base, err := s.fetchManifest(r.Context(), item.URL, false)
-		if err != nil {
-			log.Printf("home manifest %s failed: %v", item.URL, err)
+		if !manifestSupportsResource(entry.Manifest, "catalog") {
 			continue
 		}
-		for _, catalog := range manifest.Catalogs {
-			if len(rows) >= rowLimit {
+		mediaType := normalizeCatalogType(entry.Catalog.Type)
+		if mediaType == "" {
+			continue
+		}
+		items, err := s.fetchCatalog(r.Context(), entry.Base, entry.Catalog, itemLimit*2)
+		if err != nil {
+			log.Printf("catalog %s/%s failed: %v", entry.Catalog.Type, entry.Catalog.ID, err)
+			continue
+		}
+		rowItems := make([]vortexoHomeItem, 0, itemLimit)
+		for _, meta := range items {
+			homeItem := homeItemFromStremio(meta, mediaType)
+			key := homeDedupeKey(homeItem)
+			if key == "" || used[key] {
+				continue
+			}
+			used[key] = true
+			rowItems = append(rowItems, homeItem)
+			if len(rowItems) >= itemLimit {
 				break
 			}
-			mediaType := normalizeCatalogType(catalog.Type)
-			if mediaType == "" {
-				continue
-			}
-			items, err := s.fetchCatalog(r.Context(), base, catalog, itemLimit*2)
-			if err != nil {
-				log.Printf("catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
-				continue
-			}
-			rowItems := make([]vortexoHomeItem, 0, itemLimit)
-			for _, meta := range items {
-				homeItem := homeItemFromStremio(meta, mediaType)
-				key := homeDedupeKey(homeItem)
-				if key == "" || used[key] {
-					continue
-				}
-				used[key] = true
-				rowItems = append(rowItems, homeItem)
-				if len(rowItems) >= itemLimit {
-					break
-				}
-			}
-			if len(rowItems) == 0 {
-				continue
-			}
-			title := firstNonEmpty(catalog.Name, item.Name, manifest.Name, "Recommended")
-			rows = append(rows, vortexoHomeRow{
-				ID:           slug(item.ID + "-" + catalog.Type + "-" + catalog.ID),
-				Title:        title,
-				Reason:       "Installed manifest catalog",
-				RefreshAfter: now.Add(time.Hour),
-				Items:        rowItems,
-			})
 		}
+		if len(rowItems) == 0 {
+			continue
+		}
+		title := firstNonEmpty(entry.Pref.Name, entry.Catalog.Name, entry.Item.Name, entry.Manifest.Name, "Recommended")
+		rows = append(rows, vortexoHomeRow{
+			ID:           slug(entry.Pref.Key),
+			Title:        title,
+			Reason:       "Installed manifest catalog",
+			RefreshAfter: now.Add(time.Hour),
+			Items:        rowItems,
+		})
 	}
 
 	respondJSON(w, http.StatusOK, vortexoHomeFeed{
@@ -1611,47 +1891,40 @@ func (s *appState) handleVortexoHome(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *appState) collectManifestItems(ctx context.Context, mediaType string, limit int, offset int) []vortexoHomeItem {
-	installed := s.enabledManifests()
+	entries := s.enabledCatalogEntries(ctx)
 	seen := map[string]bool{}
 	collected := make([]vortexoHomeItem, 0, limit)
 	skip := offset
 
-	for _, item := range installed {
+	for _, entry := range entries {
 		if len(collected) >= limit {
 			break
 		}
-		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
-		if err != nil {
-			log.Printf("library manifest %s failed: %v", item.URL, err)
+		if !manifestSupportsResource(entry.Manifest, "catalog") {
 			continue
 		}
-		for _, catalog := range manifest.Catalogs {
+		if normalizeCatalogType(entry.Catalog.Type) != mediaType {
+			continue
+		}
+		items, err := s.fetchCatalog(ctx, entry.Base, entry.Catalog, limit+offset+25)
+		if err != nil {
+			log.Printf("library catalog %s/%s failed: %v", entry.Catalog.Type, entry.Catalog.ID, err)
+			continue
+		}
+		for _, meta := range items {
+			homeItem := homeItemFromStremio(meta, mediaType)
+			key := homeDedupeKey(homeItem)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			if skip > 0 {
+				skip--
+				continue
+			}
+			collected = append(collected, homeItem)
 			if len(collected) >= limit {
 				break
-			}
-			if normalizeCatalogType(catalog.Type) != mediaType {
-				continue
-			}
-			items, err := s.fetchCatalog(ctx, base, catalog, limit+offset+25)
-			if err != nil {
-				log.Printf("library catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
-				continue
-			}
-			for _, meta := range items {
-				homeItem := homeItemFromStremio(meta, mediaType)
-				key := homeDedupeKey(homeItem)
-				if key == "" || seen[key] {
-					continue
-				}
-				seen[key] = true
-				if skip > 0 {
-					skip--
-					continue
-				}
-				collected = append(collected, homeItem)
-				if len(collected) >= limit {
-					break
-				}
 			}
 		}
 	}
@@ -1663,54 +1936,44 @@ func (s *appState) collectLiveChannels(ctx context.Context, limit int) []vortexo
 	if limit <= 0 {
 		limit = 500
 	}
-	installed := s.enabledManifests()
+	entries := s.enabledCatalogEntries(ctx)
 	seen := map[string]bool{}
 	channels := make([]vortexoLiveChannel, 0, minInt(limit, 100))
 	streamID := 1
 
-	for _, item := range installed {
+	for _, entry := range entries {
 		if len(channels) >= limit {
 			break
 		}
-		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if !manifestSupportsResource(entry.Manifest, "catalog") {
+			continue
+		}
+		if !isLiveCatalog(entry.Manifest, entry.Item, entry.Catalog) {
+			continue
+		}
+		items, err := s.fetchCatalog(ctx, entry.Base, entry.Catalog, limit*2)
 		if err != nil {
-			log.Printf("live manifest %s failed: %v", item.URL, err)
+			log.Printf("live catalog %s/%s failed: %v", entry.Catalog.Type, entry.Catalog.ID, err)
 			continue
 		}
-		if !manifestSupportsResource(manifest, "catalog") {
-			continue
-		}
-		for _, catalog := range manifest.Catalogs {
+		for _, meta := range items {
 			if len(channels) >= limit {
 				break
 			}
-			if !isLiveCatalog(manifest, item, catalog) {
+			channel := liveChannelFromStremio(meta, entry.Item, entry.Manifest, entry.Base, entry.Catalog, streamID)
+			if channel.ID == "" || channel.Name == "" {
 				continue
 			}
-			items, err := s.fetchCatalog(ctx, base, catalog, limit*2)
-			if err != nil {
-				log.Printf("live catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
+			if channel.StreamURL == "" && !manifestSupportsResource(entry.Manifest, "stream") {
 				continue
 			}
-			for _, meta := range items {
-				if len(channels) >= limit {
-					break
-				}
-				channel := liveChannelFromStremio(meta, item, manifest, base, catalog, streamID)
-				if channel.ID == "" || channel.Name == "" {
-					continue
-				}
-				if channel.StreamURL == "" && !manifestSupportsResource(manifest, "stream") {
-					continue
-				}
-				key := strings.ToLower(channel.ManifestID + ":" + channel.CatalogType + ":" + channel.ID)
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				channels = append(channels, channel)
-				streamID++
+			key := strings.ToLower(channel.ManifestID + ":" + channel.CatalogType + ":" + channel.ID)
+			if seen[key] {
+				continue
 			}
+			seen[key] = true
+			channels = append(channels, channel)
+			streamID++
 		}
 	}
 
@@ -1894,53 +2157,43 @@ func liveCategoriesFromChannels(channels []vortexoLiveChannel) []xtreamLiveCateg
 }
 
 func (s *appState) searchManifestItems(ctx context.Context, query string, mediaType string, limit int) []vortexoHomeItem {
-	installed := s.enabledManifests()
+	entries := s.enabledCatalogEntries(ctx)
 	seen := map[string]bool{}
 	collected := make([]vortexoHomeItem, 0, limit)
 	normalizedQuery := strings.ToLower(strings.TrimSpace(query))
 
-	for _, item := range installed {
+	for _, entry := range entries {
 		if len(collected) >= limit {
 			break
 		}
-		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if !manifestSupportsResource(entry.Manifest, "catalog") {
+			continue
+		}
+		catalogType := normalizeCatalogType(entry.Catalog.Type)
+		if catalogType == "" || (mediaType != "" && catalogType != mediaType) {
+			continue
+		}
+		if !catalogSupportsSearch(entry.Catalog) {
+			continue
+		}
+		items, err := s.fetchCatalogSearch(ctx, entry.Base, entry.Catalog, query, limit*2)
 		if err != nil {
-			log.Printf("search manifest %s failed: %v", item.URL, err)
+			log.Printf("search catalog %s/%s failed: %v", entry.Catalog.Type, entry.Catalog.ID, err)
 			continue
 		}
-		if !manifestSupportsResource(manifest, "catalog") {
-			continue
-		}
-		for _, catalog := range manifest.Catalogs {
+		for _, meta := range items {
+			homeItem := homeItemFromStremio(meta, catalogType)
+			if !homeItemMatchesSearch(homeItem, normalizedQuery) {
+				continue
+			}
+			key := homeDedupeKey(homeItem)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			collected = append(collected, homeItem)
 			if len(collected) >= limit {
 				break
-			}
-			catalogType := normalizeCatalogType(catalog.Type)
-			if catalogType == "" || (mediaType != "" && catalogType != mediaType) {
-				continue
-			}
-			if !catalogSupportsSearch(catalog) {
-				continue
-			}
-			items, err := s.fetchCatalogSearch(ctx, base, catalog, query, limit*2)
-			if err != nil {
-				log.Printf("search catalog %s/%s failed: %v", catalog.Type, catalog.ID, err)
-				continue
-			}
-			for _, meta := range items {
-				homeItem := homeItemFromStremio(meta, catalogType)
-				if !homeItemMatchesSearch(homeItem, normalizedQuery) {
-					continue
-				}
-				key := homeDedupeKey(homeItem)
-				if key == "" || seen[key] {
-					continue
-				}
-				seen[key] = true
-				collected = append(collected, homeItem)
-				if len(collected) >= limit {
-					break
-				}
 			}
 		}
 	}
@@ -2620,6 +2873,25 @@ func (s *appState) fetchCatalogExtra(ctx context.Context, base string, catalog s
 	}
 	for i := range items {
 		items[i] = canonicalStremioMeta(items[i], "", catalog.Type)
+	}
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
+func (s *appState) fetchAddonCatalog(ctx context.Context, base string, catalog stremioCatalog, limit int) ([]addonCatalogEntry, error) {
+	u := fmt.Sprintf("%s/addon_catalog/%s/%s.json", strings.TrimRight(base, "/"), url.PathEscape(catalog.Type), url.PathEscape(catalog.ID))
+	var response addonCatalogResponse
+	if err := s.getJSON(ctx, u, &response); err != nil {
+		return nil, err
+	}
+	items := response.Addons
+	if len(items) == 0 {
+		items = response.Items
+	}
+	if len(items) == 0 {
+		items = response.Metas
 	}
 	if limit > 0 && len(items) > limit {
 		items = items[:limit]
@@ -3689,13 +3961,86 @@ func manifestCapabilities(manifest stremioManifest) []string {
 	return out
 }
 
-func dashboardCatalogs(manifest stremioManifest) []dashboardManifestCatalog {
+func (s *appState) dashboardCatalogs(ctx context.Context) []dashboardManifestCatalog {
+	s.mu.RLock()
+	installed := append([]installedManifest(nil), s.config.Manifests...)
+	prefs := catalogPreferenceMapLocked(s.config.Catalogs)
+	s.mu.RUnlock()
+
+	all := make([]dashboardManifestCatalog, 0)
+	order := 0
+	for _, item := range installed {
+		if !item.Enabled {
+			continue
+		}
+		manifest, _, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			continue
+		}
+		catalogs := dashboardCatalogs(item, manifest, prefs, order)
+		order += len(manifest.Catalogs)
+		all = append(all, catalogs...)
+	}
+	sortDashboardCatalogs(all)
+	return all
+}
+
+func (s *appState) enabledCatalogEntries(ctx context.Context) []manifestCatalogEntry {
+	s.mu.RLock()
+	installed := append([]installedManifest(nil), s.config.Manifests...)
+	prefs := catalogPreferenceMapLocked(s.config.Catalogs)
+	s.mu.RUnlock()
+
+	entries := make([]manifestCatalogEntry, 0)
+	order := 0
+	for _, item := range installed {
+		if !item.Enabled || strings.TrimSpace(item.URL) == "" {
+			continue
+		}
+		manifest, base, err := s.fetchManifest(ctx, item.URL, false)
+		if err != nil {
+			log.Printf("manifest %s failed: %v", item.URL, err)
+			continue
+		}
+		for _, catalog := range manifest.Catalogs {
+			pref := catalogPreferenceFor(prefs, item, catalog, order)
+			order++
+			if !pref.Enabled {
+				continue
+			}
+			entries = append(entries, manifestCatalogEntry{
+				Item:     item,
+				Manifest: manifest,
+				Base:     base,
+				Catalog:  catalog,
+				Pref:     pref,
+				Order:    pref.SortOrder,
+			})
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Order != entries[j].Order {
+			return entries[i].Order < entries[j].Order
+		}
+		return entries[i].Pref.Key < entries[j].Pref.Key
+	})
+	return entries
+}
+
+func dashboardCatalogs(item installedManifest, manifest stremioManifest, prefs map[string]catalogPreference, startOrder int) []dashboardManifestCatalog {
 	catalogs := make([]dashboardManifestCatalog, 0, len(manifest.Catalogs))
-	for _, catalog := range manifest.Catalogs {
-		item := dashboardManifestCatalog{
-			Type: catalog.Type,
-			ID:   catalog.ID,
-			Name: catalog.Name,
+	for index, catalog := range manifest.Catalogs {
+		pref := catalogPreferenceFor(prefs, item, catalog, startOrder+index)
+		entry := dashboardManifestCatalog{
+			Key:          pref.Key,
+			ManifestID:   pref.ManifestID,
+			ManifestName: firstNonEmpty(item.Name, manifest.Name, item.ID),
+			Type:         catalog.Type,
+			ID:           catalog.ID,
+			Name:         firstNonEmpty(pref.Name, catalog.Name, catalog.ID),
+			OriginalName: firstNonEmpty(catalog.Name, catalog.ID),
+			Enabled:      pref.Enabled,
+			SortOrder:    pref.SortOrder,
 		}
 		for _, extra := range catalog.Extra {
 			name := strings.TrimSpace(extra.Name)
@@ -3703,17 +4048,239 @@ func dashboardCatalogs(manifest stremioManifest) []dashboardManifestCatalog {
 				continue
 			}
 			if strings.EqualFold(name, "search") {
-				item.Search = true
+				entry.Search = true
 			}
 			if extra.IsRequired {
-				item.RequiredExtras = append(item.RequiredExtras, name)
+				entry.RequiredExtras = append(entry.RequiredExtras, name)
 			} else {
-				item.OptionalExtras = append(item.OptionalExtras, name)
+				entry.OptionalExtras = append(entry.OptionalExtras, name)
 			}
 		}
-		catalogs = append(catalogs, item)
+		catalogs = append(catalogs, entry)
 	}
+	sortDashboardCatalogs(catalogs)
 	return catalogs
+}
+
+func catalogPreferenceFor(prefs map[string]catalogPreference, item installedManifest, catalog stremioCatalog, order int) catalogPreference {
+	key := catalogKey(item.ID, catalog.Type, catalog.ID)
+	if pref, ok := prefs[key]; ok {
+		pref.Key = key
+		pref.ManifestID = firstNonEmpty(pref.ManifestID, item.ID)
+		pref.CatalogType = firstNonEmpty(pref.CatalogType, catalog.Type)
+		pref.CatalogID = firstNonEmpty(pref.CatalogID, catalog.ID)
+		return pref
+	}
+	return catalogPreference{
+		Key:         key,
+		ManifestID:  item.ID,
+		CatalogType: catalog.Type,
+		CatalogID:   catalog.ID,
+		Enabled:     true,
+		SortOrder:   order,
+	}
+}
+
+func catalogPreferenceMapLocked(items []catalogPreference) map[string]catalogPreference {
+	out := make(map[string]catalogPreference, len(items))
+	for _, item := range items {
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			key = catalogKey(item.ManifestID, item.CatalogType, item.CatalogID)
+		}
+		if key == "" {
+			continue
+		}
+		item.Key = key
+		out[key] = item
+	}
+	return out
+}
+
+func catalogKey(manifestID, catalogType, catalogID string) string {
+	manifestID = strings.TrimSpace(manifestID)
+	catalogType = strings.TrimSpace(catalogType)
+	catalogID = strings.TrimSpace(catalogID)
+	if manifestID == "" || catalogType == "" || catalogID == "" {
+		return ""
+	}
+	return manifestID + "|" + catalogType + "|" + catalogID
+}
+
+func splitCatalogKey(key string) (string, string, string) {
+	parts := strings.SplitN(strings.TrimSpace(key), "|", 3)
+	if len(parts) != 3 {
+		return "", "", ""
+	}
+	return parts[0], parts[1], parts[2]
+}
+
+func sortDashboardCatalogs(catalogs []dashboardManifestCatalog) {
+	sort.SliceStable(catalogs, func(i, j int) bool {
+		if catalogs[i].SortOrder != catalogs[j].SortOrder {
+			return catalogs[i].SortOrder < catalogs[j].SortOrder
+		}
+		if catalogs[i].ManifestName != catalogs[j].ManifestName {
+			return strings.ToLower(catalogs[i].ManifestName) < strings.ToLower(catalogs[j].ManifestName)
+		}
+		return strings.ToLower(catalogs[i].Name) < strings.ToLower(catalogs[j].Name)
+	})
+}
+
+func removeManifestCatalogPreferences(items []catalogPreference, manifestID string) []catalogPreference {
+	next := items[:0]
+	prefix := manifestID + "|"
+	for _, item := range items {
+		if item.ManifestID == manifestID || strings.HasPrefix(item.Key, prefix) {
+			continue
+		}
+		next = append(next, item)
+	}
+	return next
+}
+
+func installedManifestURLSet(items []installedManifest) map[string]bool {
+	out := make(map[string]bool, len(items))
+	for _, item := range items {
+		if normalized := normalizeManifestURL(item.URL); normalized != "" {
+			out[strings.ToLower(normalized)] = true
+		}
+	}
+	return out
+}
+
+func dashboardAddonFromEntry(entry addonCatalogEntry, installedURLs map[string]bool) dashboardAddon {
+	manifest := entry.Manifest
+	if manifest.ID == "" {
+		manifest.ID = entry.ID
+	}
+	if manifest.Name == "" {
+		manifest.Name = entry.Name
+	}
+	if manifest.Description == "" {
+		manifest.Description = entry.Description
+	}
+	if manifest.Logo == "" {
+		manifest.Logo = entry.Logo
+	}
+	if manifest.Version == "" {
+		manifest.Version = entry.Version
+	}
+	manifestURL := normalizeManifestURL(firstNonEmpty(entry.TransportURL, entry.URL))
+	catalogs := dashboardCatalogs(installedManifest{ID: slug(firstNonEmpty(manifest.ID, manifest.Name, manifestURL)), Name: manifest.Name}, manifest, nil, 0)
+	configRequired := manifestBoolHint(manifest, "configurationRequired", "requiresConfiguration")
+	configurable := manifestBoolHint(manifest, "configurable") || configRequired
+	configURL := ""
+	if configurable {
+		configURL = addonConfigURL(manifestURL)
+	}
+	return dashboardAddon{
+		ID:                    firstNonEmpty(manifest.ID, slug(manifest.Name), slug(manifestURL)),
+		Name:                  firstNonEmpty(manifest.Name, manifest.ID, manifestURL),
+		Description:           manifest.Description,
+		Version:               manifest.Version,
+		Logo:                  manifest.Logo,
+		URL:                   manifestURL,
+		ConfigURL:             configURL,
+		TransportName:         entry.TransportName,
+		Installed:             installedURLs[strings.ToLower(manifestURL)],
+		Configurable:          configurable,
+		ConfigurationRequired: configRequired,
+		Resources:             manifestResourceNames(manifest),
+		Types:                 append([]string(nil), manifest.Types...),
+		Capabilities:          manifestCapabilities(manifest),
+		Catalogs:              catalogs,
+	}
+}
+
+func addonMatchesFilters(addon dashboardAddon, query, capability, mediaType string) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query != "" {
+		text := strings.ToLower(strings.Join([]string{
+			addon.ID,
+			addon.Name,
+			addon.Description,
+			addon.URL,
+			strings.Join(addon.Capabilities, " "),
+			strings.Join(addon.Types, " "),
+		}, " "))
+		if !strings.Contains(text, query) {
+			return false
+		}
+	}
+	capability = strings.ToLower(strings.TrimSpace(capability))
+	if capability != "" && capability != "all" {
+		found := false
+		for _, item := range append(append([]string{}, addon.Capabilities...), addon.Resources...) {
+			if strings.EqualFold(item, capability) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType != "" && mediaType != "all" {
+		normalized := normalizeStremioType(mediaType)
+		found := false
+		for _, item := range addon.Types {
+			if normalizeStremioType(item) == normalized || strings.EqualFold(item, mediaType) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			for _, catalog := range addon.Catalogs {
+				if normalizeStremioType(catalog.Type) == normalized || strings.EqualFold(catalog.Type, mediaType) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func addonConfigURL(manifestURL string) string {
+	manifestURL = normalizeManifestURL(manifestURL)
+	if manifestURL == "" {
+		return ""
+	}
+	return strings.TrimSuffix(manifestURL, "/manifest.json") + "/configure"
+}
+
+func manifestBoolHint(manifest stremioManifest, keys ...string) bool {
+	hints, ok := manifest.BehaviorHints.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, key := range keys {
+		for rawKey, rawValue := range hints {
+			if !strings.EqualFold(rawKey, key) {
+				continue
+			}
+			switch value := rawValue.(type) {
+			case bool:
+				if value {
+					return true
+				}
+			case string:
+				if parsed, err := strconv.ParseBool(value); err == nil && parsed {
+					return true
+				}
+			case float64:
+				if value != 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func hasLiveManifestCatalog(manifest stremioManifest) bool {
