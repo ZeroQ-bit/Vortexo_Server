@@ -2643,6 +2643,8 @@ func (s *appState) syncPlexWatchState(ctx context.Context) ([]watchStateItem, er
 	q.Set("X-Plex-Token", token)
 	q.Set("sort", "viewedAt:desc")
 	q.Set("size", "500")
+	q.Set("X-Plex-Container-Start", "0")
+	q.Set("X-Plex-Container-Size", "500")
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -3568,10 +3570,26 @@ func normalizedInstances(primary string, extra []string, defaults []string) []st
 
 func responseMessage(body []byte) string {
 	var decoded any
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return ""
+	if err := json.Unmarshal(body, &decoded); err == nil {
+		if message := findMessage(decoded); message != "" {
+			return message
+		}
 	}
-	return findMessage(decoded)
+	var xmlMessage struct {
+		Message string `xml:"message,attr"`
+		Error   string `xml:"error,attr"`
+		Text    string `xml:",chardata"`
+	}
+	if err := xml.Unmarshal(body, &xmlMessage); err == nil {
+		if message := firstNonEmpty(xmlMessage.Message, xmlMessage.Error, strings.TrimSpace(xmlMessage.Text)); message != "" {
+			return message
+		}
+	}
+	message := strings.TrimSpace(string(bytes.TrimSpace(body)))
+	if len(message) > 240 {
+		return message[:240] + "..."
+	}
+	return message
 }
 
 func findMessage(value any) string {
@@ -4692,8 +4710,11 @@ func traktShowAPIID(show traktShow) string {
 
 func decodePlexHistory(data []byte) ([]plexMetadata, error) {
 	var jsonResponse plexHistoryResponse
-	if err := json.Unmarshal(data, &jsonResponse); err == nil && len(jsonResponse.MediaContainer.Metadata) > 0 {
-		return jsonResponse.MediaContainer.Metadata, nil
+	if err := json.Unmarshal(data, &jsonResponse); err == nil {
+		trimmed := bytes.TrimSpace(data)
+		if len(jsonResponse.MediaContainer.Metadata) > 0 || (len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')) {
+			return jsonResponse.MediaContainer.Metadata, nil
+		}
 	}
 
 	var xmlResponse plexHistoryXML

@@ -86,6 +86,13 @@ label {
   font-weight: 700;
 }
 
+.field-help {
+  color: #8fa0b5;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
 h1,
 h2,
 h3,
@@ -629,6 +636,18 @@ h3 {
   padding: 10px;
   border-radius: 8px;
   font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.inline-note {
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  color: #d9f99d;
+  background: rgba(77, 124, 15, 0.18);
+  border: 1px solid rgba(132, 204, 22, 0.22);
+  font-size: 12px;
+  font-weight: 700;
   overflow-wrap: anywhere;
 }
 
