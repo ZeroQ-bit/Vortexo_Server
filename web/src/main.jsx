@@ -511,6 +511,34 @@ function App() {
     }
   }
 
+  async function clearWatchHistory() {
+    const count = dashboard.watch?.count || 0;
+    const warning = count > 0
+      ? `Delete ${count} watch history item${count === 1 ? "" : "s"} from Vortexo Server?`
+      : "Delete watch history from Vortexo Server?";
+    if (!window.confirm(`${warning}\n\nThis clears local Continue Watching/recommendation state but keeps your Trakt and Plex connections.`)) {
+      return;
+    }
+
+    setBusy(true);
+    setWatchStatus("Clearing watch history...");
+    try {
+      const data = await request("/api/v1/bridge/watch/history", { method: "DELETE" });
+      await loadDashboard();
+      await loadWatchSettings();
+      await loadPublicHome();
+      const removed = data.removed || 0;
+      const nextMessage = `Deleted ${removed} watch history item${removed === 1 ? "" : "s"}.`;
+      setMessage(nextMessage);
+      setWatchStatus(nextMessage);
+    } catch (error) {
+      setMessage(error.message);
+      setWatchStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function savePlexToken(event) {
     event.preventDefault();
     const accessToken = plexAccessToken.trim();
@@ -733,6 +761,7 @@ function App() {
                 status={watchStatus}
                 onSave={saveWatch}
                 onSync={syncWatch}
+                onClearHistory={clearWatchHistory}
                 plex={plexSettings}
                 artwork={dashboard.artwork || {}}
                 plexAccessToken={plexAccessToken}
@@ -1182,6 +1211,7 @@ function WatchSync({
   status,
   onSave,
   onSync,
+  onClearHistory,
   plex,
   artwork,
   plexAccessToken,
@@ -1225,6 +1255,10 @@ function WatchSync({
         <div className="form-actions">
           <button type="submit" disabled={busy}>Save</button>
           <button type="button" className="secondary" onClick={onSync} disabled={busy || !hasTraktConfig}>Sync Trakt</button>
+          <button type="button" className="secondary danger-action" onClick={onClearHistory} disabled={busy || !(watch.count > 0)}>
+            <Trash2 size={16} />
+            Clear history
+          </button>
         </div>
         {status && <div className={isErrorMessage(status) ? "inline-error" : "inline-note"}>{status}</div>}
       </form>

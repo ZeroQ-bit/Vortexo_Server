@@ -60,6 +60,19 @@ button.secondary:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.14);
 }
 
+button.danger-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.18);
+  border-color: rgba(248, 113, 113, 0.24);
+}
+
+button.danger-action:hover:not(:disabled) {
+  background: rgba(153, 27, 27, 0.28);
+}
+
 input,
 select {
   width: 100%;

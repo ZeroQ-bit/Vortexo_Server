@@ -985,6 +985,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/bridge/manifests", s.requireAuth(s.handleManifests))
 	mux.HandleFunc("/api/v1/bridge/manifests/", s.requireAuth(s.handleManifestByID))
 	mux.HandleFunc("/api/v1/bridge/watch/settings", s.requireAuth(s.handleWatchSettings))
+	mux.HandleFunc("/api/v1/bridge/watch/history", s.requireAuth(s.handleClearWatchHistory))
 	mux.HandleFunc("/api/v1/bridge/watch/trakt/device-code", s.requireAuth(s.handleTraktDeviceCode))
 	mux.HandleFunc("/api/v1/bridge/watch/trakt/device-token", s.requireAuth(s.handleTraktDeviceToken))
 	mux.HandleFunc("/api/v1/bridge/watch/trakt/sync", s.requireAuth(s.handleTraktWatchSync))
@@ -1455,6 +1456,32 @@ func (s *appState) handleWatchSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (s *appState) handleClearWatchHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	s.mu.Lock()
+	removed := len(s.watchState.Items)
+	s.watchState.Items = []watchStateItem{}
+	s.watchMeta = map[string]watchStateMetadataCacheEntry{}
+	err := s.saveWatchStateLocked()
+	updatedAt := s.watchState.UpdatedAt
+	s.mu.Unlock()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to clear watch history")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"removed":    removed,
+		"total":      0,
+		"updated_at": updatedAt,
+	})
 }
 
 func (s *appState) handlePlexSettings(w http.ResponseWriter, r *http.Request) {
