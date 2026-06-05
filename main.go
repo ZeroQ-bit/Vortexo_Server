@@ -26,10 +26,14 @@ import (
 )
 
 const (
-	defaultListenAddr  = ":8080"
-	defaultUsername    = "vortexo"
-	defaultPassword    = "vortexo"
-	defaultRegistryURL = "https://stremio-addons.net/api/manifest.json"
+	defaultListenAddr               = ":8080"
+	defaultUsername                 = "vortexo"
+	defaultPassword                 = "vortexo"
+	defaultRegistryURL              = "https://stremio-addons.net/api/manifest.json"
+	watchStateEnrichmentLimit       = 48
+	watchStateEnrichmentConcurrency = 6
+	watchStateMetadataTimeout       = 6 * time.Second
+	watchStateMetadataCacheTTL      = 30 * time.Minute
 )
 
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
@@ -41,6 +45,7 @@ type appState struct {
 	watchState watchStateStore
 	client     *http.Client
 	manifest   map[string]manifestCacheEntry
+	watchMeta  map[string]watchStateMetadataCacheEntry
 }
 
 type bridgeConfig struct {
@@ -179,6 +184,11 @@ type manifestCacheEntry struct {
 	manifest stremioManifest
 	baseURL  string
 	expires  time.Time
+}
+
+type watchStateMetadataCacheEntry struct {
+	item    watchStateItem
+	expires time.Time
 }
 
 type stremioManifest struct {
@@ -536,6 +546,17 @@ type watchStateItem struct {
 	ProgressPercent float64   `json:"progress_percent,omitempty"`
 	ProgressSeconds int       `json:"progress_seconds,omitempty"`
 	DurationSeconds int       `json:"duration_seconds,omitempty"`
+	Overview        string    `json:"overview,omitempty"`
+	PosterPath      string    `json:"poster_path,omitempty"`
+	BackdropPath    string    `json:"backdrop_path,omitempty"`
+	LandscapePath   string    `json:"landscape_path,omitempty"`
+	LogoPath        string    `json:"logo_path,omitempty"`
+	StillPath       string    `json:"still_path,omitempty"`
+	ReleaseDate     string    `json:"release_date,omitempty"`
+	AirDate         string    `json:"air_date,omitempty"`
+	Runtime         int       `json:"runtime,omitempty"`
+	Genres          []string  `json:"genres,omitempty"`
+	VoteAverage     float64   `json:"vote_average,omitempty"`
 	PlayCount       int       `json:"play_count,omitempty"`
 	Source          string    `json:"source"`
 	SourceUserID    string    `json:"source_user_id,omitempty"`
@@ -667,9 +688,10 @@ func run() error {
 	}
 
 	state := &appState{
-		dataDir:  dataDir,
-		client:   &http.Client{Timeout: 20 * time.Second},
-		manifest: map[string]manifestCacheEntry{},
+		dataDir:   dataDir,
+		client:    &http.Client{Timeout: 20 * time.Second},
+		manifest:  map[string]manifestCacheEntry{},
+		watchMeta: map[string]watchStateMetadataCacheEntry{},
 	}
 	if err := state.load(); err != nil {
 		return err
@@ -1097,9 +1119,237 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 	state := s.watchState
 	if state.Items == nil {
 		state.Items = []watchStateItem{}
+	} else {
+		state.Items = append([]watchStateItem(nil), state.Items...)
 	}
 	s.mu.RUnlock()
+	state.Items = s.enrichWatchStateWithManifestMetadata(r.Context(), state.Items)
 	respondJSON(w, http.StatusOK, state)
+}
+
+func (s *appState) enrichWatchStateWithManifestMetadata(ctx context.Context, items []watchStateItem) []watchStateItem {
+	if len(items) == 0 {
+		return items
+	}
+
+	enriched := append([]watchStateItem(nil), items...)
+	limit := minInt(len(enriched), watchStateEnrichmentLimit)
+	sem := make(chan struct{}, watchStateEnrichmentConcurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < limit; i++ {
+		if !watchStateCanUseManifestMetadata(enriched[i]) {
+			continue
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return enriched
+		}
+
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			enriched[index] = s.enrichWatchStateItemWithManifestMetadata(ctx, enriched[index])
+		}(i)
+	}
+
+	wg.Wait()
+	return enriched
+}
+
+func watchStateCanUseManifestMetadata(item watchStateItem) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(item.MediaType))
+	if mediaType != "movie" && mediaType != "episode" {
+		return false
+	}
+	return len(watchStateManifestIDs(item)) > 0
+}
+
+func (s *appState) enrichWatchStateItemWithManifestMetadata(ctx context.Context, item watchStateItem) watchStateItem {
+	key := watchStateKey(item)
+	if key == "" {
+		return item
+	}
+
+	now := time.Now()
+	s.mu.RLock()
+	if cached, ok := s.watchMeta[key]; ok && now.Before(cached.expires) {
+		s.mu.RUnlock()
+		return mergeWatchStateAddonMetadata(item, cached.item)
+	}
+	s.mu.RUnlock()
+
+	itemCtx, cancel := context.WithTimeout(ctx, watchStateMetadataTimeout)
+	defer cancel()
+
+	enriched, ok := s.lookupWatchStateManifestMetadata(itemCtx, item)
+	if !ok {
+		return item
+	}
+
+	s.mu.Lock()
+	if s.watchMeta == nil {
+		s.watchMeta = map[string]watchStateMetadataCacheEntry{}
+	}
+	s.watchMeta[key] = watchStateMetadataCacheEntry{
+		item:    enriched,
+		expires: now.Add(watchStateMetadataCacheTTL),
+	}
+	s.mu.Unlock()
+
+	return enriched
+}
+
+func (s *appState) lookupWatchStateManifestMetadata(ctx context.Context, item watchStateItem) (watchStateItem, bool) {
+	mediaType := strings.ToLower(strings.TrimSpace(item.MediaType))
+	manifestType := mediaType
+	if manifestType == "episode" {
+		manifestType = "series"
+	}
+
+	for _, id := range watchStateManifestIDs(item) {
+		meta, err := s.findManifestMeta(ctx, manifestType, id)
+		if err != nil {
+			continue
+		}
+		enriched := applyWatchStateManifestMetadata(item, meta)
+		if watchStateHasManifestMetadata(enriched) {
+			return enriched, true
+		}
+	}
+	return item, false
+}
+
+func applyWatchStateManifestMetadata(item watchStateItem, meta stremioMeta) watchStateItem {
+	mediaType := strings.ToLower(strings.TrimSpace(item.MediaType))
+	fallbackType := mediaType
+	if fallbackType == "episode" {
+		fallbackType = "series"
+	}
+
+	homeItem := homeItemFromStremio(meta, fallbackType)
+	if mediaType == "movie" {
+		item.Title = firstNonEmpty(homeItem.Title, item.Title)
+	} else {
+		item.ParentTitle = firstNonEmpty(item.ParentTitle, homeItem.Title)
+	}
+	item.Year = firstNonZero(item.Year, homeItem.Year)
+	item.IMDBID = firstNonEmpty(item.IMDBID, homeItem.IMDBID)
+	item.TMDBID = firstNonZero(item.TMDBID, homeItem.TMDBID)
+	item.Overview = firstNonEmpty(item.Overview, homeItem.Overview)
+	item.PosterPath = firstNonEmpty(item.PosterPath, homeItem.PosterPath)
+	item.BackdropPath = firstNonEmpty(item.BackdropPath, homeItem.BackdropPath)
+	item.LandscapePath = firstNonEmpty(item.LandscapePath, homeItem.LandscapePath)
+	item.LogoPath = firstNonEmpty(item.LogoPath, homeItem.LogoPath)
+	item.ReleaseDate = firstNonEmpty(item.ReleaseDate, homeItem.ReleaseDate, homeItem.FirstAirDate)
+	item.Runtime = firstNonZero(item.Runtime, homeItem.Runtime)
+	if len(item.Genres) == 0 {
+		item.Genres = uniqueNonEmptyStrings(homeItem.Genres)
+	}
+	if item.VoteAverage == 0 {
+		item.VoteAverage = homeItem.VoteAverage
+	}
+
+	if mediaType == "episode" {
+		if video, ok := matchingStremioEpisodeVideo(meta, item.Season, item.Episode); ok {
+			item.Title = firstNonEmpty(video.Title, video.Name, item.Title)
+			item.Overview = firstNonEmpty(video.Overview, video.Description, item.Overview)
+			item.StillPath = firstNonEmpty(item.StillPath, video.Thumbnail, video.Poster)
+			item.LandscapePath = firstNonEmpty(item.LandscapePath, homeItem.LandscapePath)
+			item.AirDate = firstNonEmpty(item.AirDate, dateFromText(firstNonEmpty(video.Released, video.FirstAired)))
+			item.Runtime = firstNonZero(runtimeMinutes(video.Runtime), item.Runtime)
+		}
+		item.AirDate = firstNonEmpty(item.AirDate, item.ReleaseDate)
+	}
+
+	if item.DurationSeconds == 0 && item.Runtime > 0 {
+		item.DurationSeconds = item.Runtime * 60
+	}
+	return item
+}
+
+func matchingStremioEpisodeVideo(meta stremioMeta, season int, episode int) (stremioVideo, bool) {
+	if season <= 0 || episode <= 0 {
+		return stremioVideo{}, false
+	}
+	for _, video := range meta.Videos {
+		videoSeason := intFromAny(video.Season)
+		videoEpisode := intFromAny(video.Episode)
+		if videoSeason == 0 || videoEpisode == 0 {
+			idSeason, idEpisode := seasonEpisodeFromVideoID(video.ID)
+			if videoSeason == 0 {
+				videoSeason = idSeason
+			}
+			if videoEpisode == 0 {
+				videoEpisode = idEpisode
+			}
+		}
+		if videoSeason == season && videoEpisode == episode {
+			return video, true
+		}
+	}
+	return stremioVideo{}, false
+}
+
+func watchStateManifestIDs(item watchStateItem) []string {
+	var ids []string
+	if item.IMDBID != "" {
+		ids = append(ids, item.IMDBID)
+	}
+	if item.TMDBID > 0 {
+		tmdbID := strconv.Itoa(item.TMDBID)
+		ids = append(ids, "tmdb:"+tmdbID, tmdbID)
+	}
+	if item.TVDBID > 0 {
+		ids = append(ids, "tvdb:"+strconv.Itoa(item.TVDBID))
+	}
+	if id := imdbFromID(item.ID); id != "" {
+		ids = append(ids, id)
+	}
+	return uniqueNonEmptyStrings(ids)
+}
+
+func watchStateHasManifestMetadata(item watchStateItem) bool {
+	return firstNonEmpty(
+		item.Overview,
+		item.PosterPath,
+		item.BackdropPath,
+		item.LandscapePath,
+		item.LogoPath,
+		item.StillPath,
+	) != ""
+}
+
+func mergeWatchStateAddonMetadata(base watchStateItem, metadata watchStateItem) watchStateItem {
+	base.Title = firstNonEmpty(metadata.Title, base.Title)
+	base.ParentTitle = firstNonEmpty(base.ParentTitle, metadata.ParentTitle)
+	base.Year = firstNonZero(base.Year, metadata.Year)
+	base.IMDBID = firstNonEmpty(base.IMDBID, metadata.IMDBID)
+	base.TMDBID = firstNonZero(base.TMDBID, metadata.TMDBID)
+	base.TVDBID = firstNonZero(base.TVDBID, metadata.TVDBID)
+	base.Overview = firstNonEmpty(metadata.Overview, base.Overview)
+	base.PosterPath = firstNonEmpty(metadata.PosterPath, base.PosterPath)
+	base.BackdropPath = firstNonEmpty(metadata.BackdropPath, base.BackdropPath)
+	base.LandscapePath = firstNonEmpty(metadata.LandscapePath, base.LandscapePath)
+	base.LogoPath = firstNonEmpty(metadata.LogoPath, base.LogoPath)
+	base.StillPath = firstNonEmpty(metadata.StillPath, base.StillPath)
+	base.ReleaseDate = firstNonEmpty(metadata.ReleaseDate, base.ReleaseDate)
+	base.AirDate = firstNonEmpty(metadata.AirDate, base.AirDate)
+	base.Runtime = firstNonZero(base.Runtime, metadata.Runtime)
+	if len(base.Genres) == 0 {
+		base.Genres = uniqueNonEmptyStrings(metadata.Genres)
+	}
+	if base.VoteAverage == 0 {
+		base.VoteAverage = metadata.VoteAverage
+	}
+	if base.DurationSeconds == 0 && base.Runtime > 0 {
+		base.DurationSeconds = base.Runtime * 60
+	}
+	return base
 }
 
 func (s *appState) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
@@ -3522,7 +3772,7 @@ func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem 
 		Overview:      meta.Description,
 		PosterPath:    meta.Poster,
 		BackdropPath:  meta.Background,
-		LandscapePath: meta.Background,
+		LandscapePath: stremioLandscapePath(meta),
 		LogoPath:      meta.Logo,
 		Year:          year,
 		Runtime:       runtimeMinutes(meta.Runtime),
@@ -3649,6 +3899,29 @@ func manifestVideosFromStremio(meta stremioMeta) []map[string]any {
 	}
 
 	return videos
+}
+
+func stremioLandscapePath(meta stremioMeta) string {
+	for _, trailer := range meta.Trailers {
+		if thumbnail := youtubeLandscapeThumbnailURL(trailer.Source); thumbnail != "" {
+			return thumbnail
+		}
+	}
+	for _, stream := range meta.TrailerStreams {
+		source := firstNonEmpty(stream.YTID, stream.YouTubeID, stream.URL)
+		if thumbnail := youtubeLandscapeThumbnailURL(source); thumbnail != "" {
+			return thumbnail
+		}
+	}
+	return ""
+}
+
+func youtubeLandscapeThumbnailURL(source string) string {
+	key := youtubeVideoID(source)
+	if key == "" {
+		return ""
+	}
+	return "https://i.ytimg.com/vi/" + url.PathEscape(key) + "/hq720.jpg"
 }
 
 func xtreamMovieInfoFromStremio(meta stremioMeta) map[string]any {
@@ -4631,6 +4904,21 @@ func mergeWatchStateItem(existing watchStateItem, incoming watchStateItem) watch
 	existing.WatchedAt = maxTime(existing.WatchedAt, incoming.WatchedAt)
 	existing.PlayCount = maxInt(existing.PlayCount, incoming.PlayCount)
 	existing.Source = mergeSourceLabel(existing.Source, incoming.Source)
+	existing.Overview = firstNonEmpty(existing.Overview, incoming.Overview)
+	existing.PosterPath = firstNonEmpty(existing.PosterPath, incoming.PosterPath)
+	existing.BackdropPath = firstNonEmpty(existing.BackdropPath, incoming.BackdropPath)
+	existing.LandscapePath = firstNonEmpty(existing.LandscapePath, incoming.LandscapePath)
+	existing.LogoPath = firstNonEmpty(existing.LogoPath, incoming.LogoPath)
+	existing.StillPath = firstNonEmpty(existing.StillPath, incoming.StillPath)
+	existing.ReleaseDate = firstNonEmpty(existing.ReleaseDate, incoming.ReleaseDate)
+	existing.AirDate = firstNonEmpty(existing.AirDate, incoming.AirDate)
+	existing.Runtime = firstNonZero(existing.Runtime, incoming.Runtime)
+	if len(existing.Genres) == 0 {
+		existing.Genres = uniqueNonEmptyStrings(incoming.Genres)
+	}
+	if existing.VoteAverage == 0 {
+		existing.VoteAverage = incoming.VoteAverage
+	}
 
 	if !incoming.UpdatedAt.IsZero() && (existing.UpdatedAt.IsZero() || !incoming.UpdatedAt.Before(existing.UpdatedAt)) {
 		if incoming.ProgressPercent > 0 {
@@ -4753,6 +5041,24 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func absoluteAddonURL(raw string, base string) string {
