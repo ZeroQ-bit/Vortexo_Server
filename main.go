@@ -3994,7 +3994,7 @@ func homeItemFromStremio(meta stremioMeta, fallbackType string) vortexoHomeItem 
 		Overview:      meta.Description,
 		PosterPath:    meta.Poster,
 		BackdropPath:  meta.Background,
-		LandscapePath: stremioLandscapePath(meta),
+		LandscapePath: "",
 		LogoPath:      meta.Logo,
 		Year:          year,
 		Runtime:       runtimeMinutes(meta.Runtime),
@@ -4121,29 +4121,6 @@ func manifestVideosFromStremio(meta stremioMeta) []map[string]any {
 	}
 
 	return videos
-}
-
-func stremioLandscapePath(meta stremioMeta) string {
-	for _, trailer := range meta.Trailers {
-		if thumbnail := youtubeLandscapeThumbnailURL(trailer.Source); thumbnail != "" {
-			return thumbnail
-		}
-	}
-	for _, stream := range meta.TrailerStreams {
-		source := firstNonEmpty(stream.YTID, stream.YouTubeID, stream.URL)
-		if thumbnail := youtubeLandscapeThumbnailURL(source); thumbnail != "" {
-			return thumbnail
-		}
-	}
-	return ""
-}
-
-func youtubeLandscapeThumbnailURL(source string) string {
-	key := youtubeVideoID(source)
-	if key == "" {
-		return ""
-	}
-	return "https://i.ytimg.com/vi/" + url.PathEscape(key) + "/hq720.jpg"
 }
 
 func (s *appState) runPlexArtworkSyncWorker(ctx context.Context) {
