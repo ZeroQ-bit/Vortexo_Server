@@ -74,6 +74,38 @@ func TestCachedPlexArtworkAppliesShowLandscapeToEpisodeWatchState(t *testing.T) 
 	}
 }
 
+func TestCachedPlexArtworkFindsTMDBKeyedRecordByIMDbHomeItem(t *testing.T) {
+	state := &appState{
+		plexArtwork: map[string]plexArtworkCacheRecord{},
+	}
+	record := plexArtworkCacheRecord{
+		plexArtworkEntry: plexArtworkEntry{
+			Version:   1,
+			MediaType: "movie",
+			TMDBID:    12345,
+			IMDBID:    "tt1234567",
+			Title:     "Keyed By TMDB",
+			Artwork: plexArtwork{
+				Landscape: []string{"https://metadata-static.plex.tv/extras/iva/keyed/landscape.jpg"},
+			},
+		},
+		Status: "ok",
+	}
+	state.plexArtwork[plexArtworkKey(record.MediaType, record.TMDBID, record.IMDBID, record.Title, record.Year)] = record
+
+	item := vortexoHomeItem{
+		MediaType: "movie",
+		IMDBID:    "tt1234567",
+		Title:     "Different Catalog Title",
+	}
+
+	state.applyCachedPlexArtworkToHomeItem(&item)
+
+	if item.LandscapePath != record.Artwork.Landscape[0] {
+		t.Fatalf("expected IMDb home item to find TMDB-keyed landscape, got %q", item.LandscapePath)
+	}
+}
+
 func TestDiscoverMetadataArtworkKeepsTrailersOutOfLandscape(t *testing.T) {
 	metadata := plexDiscoverMetadata{
 		Title: "Ghosts",

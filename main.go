@@ -2524,21 +2524,44 @@ func (s *appState) handlePlexArtworkByID(w http.ResponseWriter, r *http.Request)
 
 	raw := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/artwork/"), "/")
 	parts := strings.Split(raw, "/")
-	if len(parts) != 2 {
+	if len(parts) != 2 && len(parts) != 3 {
 		respondError(w, http.StatusNotFound, "plex artwork not found")
 		return
 	}
 	mediaType := normalizePlexArtworkMediaType(parts[0])
-	tmdbID, err := strconv.Atoi(strings.TrimSuffix(parts[1], ".json"))
-	if err != nil || tmdbID <= 0 || mediaType == "" {
+	var tmdbID int
+	var imdbID string
+	if len(parts) == 3 {
+		if !strings.EqualFold(parts[1], "imdb") {
+			respondError(w, http.StatusNotFound, "plex artwork not found")
+			return
+		}
+		imdbID = imdbFromID(strings.TrimSuffix(parts[2], ".json"))
+	} else {
+		rawID := strings.TrimSuffix(parts[1], ".json")
+		if strings.HasPrefix(strings.ToLower(rawID), "tt") {
+			imdbID = imdbFromID(rawID)
+		} else {
+			var err error
+			tmdbID, err = strconv.Atoi(rawID)
+			if err != nil {
+				respondError(w, http.StatusBadRequest, "invalid artwork id")
+				return
+			}
+		}
+	}
+	if (tmdbID <= 0 && imdbID == "") || mediaType == "" {
 		respondError(w, http.StatusBadRequest, "invalid artwork id")
 		return
 	}
 
 	if r.URL.Query().Get("refresh") == "true" {
-		item := s.findPlexArtworkSeedItem(r.Context(), mediaType, tmdbID)
-		if item.TMDBID <= 0 {
-			item = plexArtworkSeedItem{MediaType: mediaType, TMDBID: tmdbID}
+		var item plexArtworkSeedItem
+		if tmdbID > 0 {
+			item = s.findPlexArtworkSeedItem(r.Context(), mediaType, tmdbID)
+		}
+		if item.TMDBID <= 0 && item.IMDBID == "" {
+			item = plexArtworkSeedItem{MediaType: mediaType, TMDBID: tmdbID, IMDBID: imdbID}
 		}
 		record, err := s.refreshPlexArtworkSeed(r.Context(), item)
 		if err != nil {
@@ -2553,7 +2576,7 @@ func (s *appState) handlePlexArtworkByID(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	record, ok := s.getCachedPlexArtwork(mediaType, tmdbID, "", "", 0)
+	record, ok := s.getCachedPlexArtwork(mediaType, tmdbID, imdbID, "", 0)
 	if !ok || record.Status != "ok" || record.Artwork.isEmpty() {
 		respondError(w, http.StatusNotFound, "plex artwork not cached")
 		return
@@ -5386,15 +5409,35 @@ func (s *appState) applyCachedPlexArtworkToWatchStateItem(item *watchStateItem) 
 }
 
 func (s *appState) getCachedPlexArtwork(mediaType string, tmdbID int, imdbID string, title string, year int) (plexArtworkCacheRecord, bool) {
+	normalizedType := normalizePlexArtworkMediaType(mediaType)
+	normalizedIMDB := imdbFromID(imdbID)
+	normalizedTitle := slugifyPlexArtworkTitle(title)
 	keys := uniqueNonEmptyStrings([]string{
-		plexArtworkKey(mediaType, tmdbID, "", "", 0),
-		plexArtworkKey(mediaType, 0, imdbID, "", 0),
-		plexArtworkKey(mediaType, 0, "", title, year),
+		plexArtworkKey(normalizedType, tmdbID, "", "", 0),
+		plexArtworkKey(normalizedType, 0, normalizedIMDB, "", 0),
+		plexArtworkKey(normalizedType, 0, "", title, year),
 	})
 	s.plexArtworkMu.RLock()
 	defer s.plexArtworkMu.RUnlock()
 	for _, key := range keys {
 		if record, ok := s.plexArtwork[key]; ok {
+			return record, true
+		}
+	}
+
+	for _, record := range s.plexArtwork {
+		if normalizePlexArtworkMediaType(record.MediaType) != normalizedType {
+			continue
+		}
+		if tmdbID > 0 && record.TMDBID == tmdbID {
+			return record, true
+		}
+		if normalizedIMDB != "" && imdbFromID(record.IMDBID) == normalizedIMDB {
+			return record, true
+		}
+		if normalizedTitle != "" &&
+			slugifyPlexArtworkTitle(record.Title) == normalizedTitle &&
+			(year <= 0 || record.Year <= 0 || record.Year == year) {
 			return record, true
 		}
 	}
