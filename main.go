@@ -46,6 +46,7 @@ const (
 	plexArtworkIncompleteRetryAfter = time.Hour
 	plexArtworkSyncLimit            = 500
 	plexArtworkSeedCatalogLimit     = 60
+	youtubePlayerAPIKey             = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 )
 
 var srtTimestampPattern = regexp.MustCompile(`(\d{2}:\d{2}:\d{2}),(\d{3})`)
@@ -889,6 +890,27 @@ type playToken struct {
 	Title   string            `json:"title,omitempty"`
 }
 
+type youtubePlayerResponse struct {
+	StreamingData struct {
+		HLSURL          string          `json:"hlsManifestUrl"`
+		Formats         []youtubeFormat `json:"formats"`
+		AdaptiveFormats []youtubeFormat `json:"adaptiveFormats"`
+	} `json:"streamingData"`
+	PlayabilityStatus struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	} `json:"playabilityStatus"`
+}
+
+type youtubeFormat struct {
+	URL          string `json:"url"`
+	MimeType     string `json:"mimeType"`
+	QualityLabel string `json:"qualityLabel"`
+	Height       int    `json:"height"`
+	Bitrate      int    `json:"bitrate"`
+	AudioQuality string `json:"audioQuality"`
+}
+
 type traktDeviceCodeResponse struct {
 	DeviceCode      string `json:"device_code"`
 	UserCode        string `json:"user_code"`
@@ -1051,6 +1073,8 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/discover/trending", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/discover/popular", s.handleDiscoverList)
 	mux.HandleFunc("/api/v1/tmdb/", s.handleTMDBByID)
+	mux.HandleFunc("/api/v1/trailers/", s.handleTrailerPlay)
+	mux.HandleFunc("/api/v1/media/", s.handleTrailerPlay)
 	mux.HandleFunc("/api/v1/artwork/refresh", s.requireAuth(s.handlePlexArtworkRefresh))
 	mux.HandleFunc("/api/v1/artwork/status", s.requireAuth(s.handlePlexArtworkStatus))
 	mux.HandleFunc("/api/v1/artwork/", s.handlePlexArtworkByID)
@@ -4094,6 +4118,37 @@ func (s *appState) handleVortexoPlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, token.URL, http.StatusFound)
+}
+
+func (s *appState) handleTrailerPlay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	videoID := trailerVideoIDFromPath(r.URL.Path)
+	if videoID == "" {
+		respondError(w, http.StatusBadRequest, "invalid trailer request")
+		return
+	}
+
+	playbackURL, container, err := s.resolveYouTubeTrailerURL(r.Context(), videoID)
+	if err != nil {
+		respondError(w, http.StatusBadGateway, "trailer playback unavailable: "+err.Error())
+		return
+	}
+
+	if wantsJSON(r) {
+		respondJSON(w, http.StatusOK, map[string]any{
+			"url":        playbackURL,
+			"stream_url": playbackURL,
+			"direct_url": playbackURL,
+			"container":  container,
+		})
+		return
+	}
+
+	http.Redirect(w, r, playbackURL, http.StatusFound)
 }
 
 func (s *appState) handleVortexoSubtitles(w http.ResponseWriter, r *http.Request) {
@@ -8089,6 +8144,164 @@ func youtubeVideoID(value string) string {
 		}
 	}
 	return value
+}
+
+func trailerVideoIDFromPath(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "trailers" && parts[4] == "play" {
+		return youtubeVideoID(parts[3])
+	}
+	if len(parts) == 8 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "media" && parts[5] == "trailers" && parts[7] == "play" {
+		return youtubeVideoID(parts[6])
+	}
+	return ""
+}
+
+func (s *appState) resolveYouTubeTrailerURL(ctx context.Context, videoID string) (string, string, error) {
+	videoID = youtubeVideoID(videoID)
+	if videoID == "" {
+		return "", "", fmt.Errorf("missing video id")
+	}
+
+	payloads := []map[string]any{
+		{
+			"videoId": videoID,
+			"context": map[string]any{
+				"client": map[string]any{
+					"clientName":    "IOS",
+					"clientVersion": "20.10.4",
+					"deviceMake":    "Apple",
+					"deviceModel":   "iPhone16,2",
+					"osName":        "iPhone",
+					"osVersion":     "18.3.2",
+					"hl":            "en",
+					"gl":            "US",
+				},
+			},
+			"contentCheckOk": true,
+			"racyCheckOk":    true,
+		},
+		{
+			"videoId": videoID,
+			"context": map[string]any{
+				"client": map[string]any{
+					"clientName":        "ANDROID",
+					"clientVersion":     "20.10.38",
+					"androidSdkVersion": 35,
+					"osName":            "Android",
+					"osVersion":         "15",
+					"platform":          "MOBILE",
+					"hl":                "en",
+					"gl":                "US",
+					"userAgent":         "com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip",
+				},
+			},
+			"contentCheckOk": true,
+			"racyCheckOk":    true,
+		},
+	}
+
+	var lastErr error
+	for _, payload := range payloads {
+		response, err := s.fetchYouTubePlayerResponse(ctx, payload)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		playbackURL, container, err := selectYouTubePlaybackURL(response)
+		if err == nil {
+			return playbackURL, container, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no playable stream")
+	}
+	return "", "", lastErr
+}
+
+func (s *appState) fetchYouTubePlayerResponse(ctx context.Context, payload map[string]any) (youtubePlayerResponse, error) {
+	var out youtubePlayerResponse
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return out, err
+	}
+
+	endpoint := "https://www.youtube.com/youtubei/v1/player?key=" + url.QueryEscape(youtubePlayerAPIKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("User-Agent", "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iPhone OS 18_3_2 like Mac OS X; en_US)")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, fmt.Errorf("youtube player status %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&out); err != nil {
+		return out, err
+	}
+	if strings.TrimSpace(out.PlayabilityStatus.Status) != "" && out.PlayabilityStatus.Status != "OK" {
+		return out, errors.New(firstNonEmpty(out.PlayabilityStatus.Reason, out.PlayabilityStatus.Status))
+	}
+	return out, nil
+}
+
+func selectYouTubePlaybackURL(response youtubePlayerResponse) (string, string, error) {
+	if strings.TrimSpace(response.StreamingData.HLSURL) != "" {
+		return strings.TrimSpace(response.StreamingData.HLSURL), "m3u8", nil
+	}
+
+	formats := append([]youtubeFormat{}, response.StreamingData.Formats...)
+	formats = append(formats, response.StreamingData.AdaptiveFormats...)
+	sort.SliceStable(formats, func(i, j int) bool {
+		left := youtubeFormatScore(formats[i])
+		right := youtubeFormatScore(formats[j])
+		if left != right {
+			return left > right
+		}
+		return formats[i].Bitrate > formats[j].Bitrate
+	})
+	for _, format := range formats {
+		if strings.TrimSpace(format.URL) == "" {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(format.MimeType), "video/") {
+			continue
+		}
+		return strings.TrimSpace(format.URL), youtubeContainerForFormat(format), nil
+	}
+	return "", "", fmt.Errorf("no direct trailer stream")
+}
+
+func youtubeFormatScore(format youtubeFormat) int {
+	score := format.Height * 1000
+	if strings.Contains(strings.ToLower(format.MimeType), "mp4") {
+		score += 500
+	}
+	if strings.TrimSpace(format.AudioQuality) != "" || strings.Contains(strings.ToLower(format.MimeType), "mp4a") {
+		score += 250
+	}
+	return score + format.Bitrate/10000
+}
+
+func youtubeContainerForFormat(format youtubeFormat) string {
+	lower := strings.ToLower(format.MimeType)
+	switch {
+	case strings.Contains(lower, "mp4"):
+		return "mp4"
+	case strings.Contains(lower, "webm"):
+		return "webm"
+	default:
+		return "video"
+	}
 }
 
 func seasonEpisodeFromVideoID(value string) (int, int) {
