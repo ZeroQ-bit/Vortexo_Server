@@ -599,6 +599,22 @@ type watchStateItem struct {
 	UpdatedAt       time.Time `json:"updated_at"`
 }
 
+type watchStateMarkRequest struct {
+	ID          string `json:"id,omitempty"`
+	RatingKey   string `json:"rating_key,omitempty"`
+	MediaType   string `json:"media_type,omitempty"`
+	Title       string `json:"title,omitempty"`
+	ParentTitle string `json:"parent_title,omitempty"`
+	Year        int    `json:"year,omitempty"`
+	IMDBID      string `json:"imdb_id,omitempty"`
+	TMDBID      int    `json:"tmdb_id,omitempty"`
+	TVDBID      int    `json:"tvdb_id,omitempty"`
+	TraktID     int    `json:"trakt_id,omitempty"`
+	Season      int    `json:"season,omitempty"`
+	Episode     int    `json:"episode,omitempty"`
+	Watched     *bool  `json:"watched,omitempty"`
+}
+
 type plexArtwork struct {
 	CoverArt   []string `json:"coverArt"`
 	Landscape  []string `json:"landscape"`
@@ -1009,6 +1025,7 @@ func (s *appState) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/vortexo/home", s.handleVortexoHome)
 	mux.HandleFunc("/api/v1/vortexo/live-tv/rows", s.handleVortexoLiveTVRows)
 	mux.HandleFunc("/api/v1/vortexo/watch-state", s.requireAuth(s.handleVortexoWatchState))
+	mux.HandleFunc("/api/v1/vortexo/watch-state/mark", s.requireAuth(s.handleVortexoWatchStateMark))
 	mux.HandleFunc("/api/v1/vortexo/sources", s.handleVortexoSources)
 	mux.HandleFunc("/api/v1/vortexo/play/", s.handleVortexoPlay)
 	mux.HandleFunc("/api/v1/vortexo/subtitles/", s.handleVortexoSubtitles)
@@ -1702,6 +1719,63 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 		s.applyCachedPlexArtworkToWatchStateItem(&state.Items[i])
 	}
 	respondJSON(w, http.StatusOK, state)
+}
+
+func (s *appState) handleVortexoWatchStateMark(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req watchStateMarkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Watched == nil {
+		respondError(w, http.StatusBadRequest, "watched is required")
+		return
+	}
+
+	item := watchStateItemFromMarkRequest(req)
+	key := watchStateKey(item)
+	if key == "" {
+		respondError(w, http.StatusBadRequest, "watch-state identity is incomplete")
+		return
+	}
+
+	now := time.Now().UTC()
+	s.mu.Lock()
+	item.ID = key
+	item.UpdatedAt = now
+	item.Source = mergeSourceLabel(item.Source, "vortexo-manual")
+
+	if idx := s.watchStateIndexLocked(key, req); idx >= 0 {
+		item = mergeWatchStateItem(s.watchState.Items[idx], item)
+		item = applyWatchStateMark(item, *req.Watched, now)
+		s.watchState.Items[idx] = item
+	} else {
+		item = applyWatchStateMark(item, *req.Watched, now)
+		s.watchState.Items = append(s.watchState.Items, item)
+	}
+
+	sort.SliceStable(s.watchState.Items, func(i, j int) bool {
+		return s.watchState.Items[i].UpdatedAt.After(s.watchState.Items[j].UpdatedAt)
+	})
+	if s.watchMeta != nil {
+		delete(s.watchMeta, key)
+	}
+	err := s.saveWatchStateLocked()
+	s.mu.Unlock()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "failed to save watch state")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"ok":   true,
+		"item": item,
+	})
 }
 
 func (s *appState) enrichWatchStateWithManifestMetadata(ctx context.Context, items []watchStateItem) []watchStateItem {
@@ -5372,10 +5446,10 @@ func (s *appState) applyCachedPlexArtworkToHomeItem(item *vortexoHomeItem) {
 		item.LandscapePath = landscape
 	}
 	if background := firstPlexArtworkURL(record.Artwork.Background); background != "" {
-		item.BackdropPath = background
+		item.BackdropPath = firstNonEmpty(item.BackdropPath, background)
 	}
 	if logo := firstPlexArtworkURL(record.Artwork.ClearLogo); logo != "" {
-		item.LogoPath = logo
+		item.LogoPath = firstNonEmpty(item.LogoPath, logo)
 	}
 	if item.PosterPath == "" {
 		item.PosterPath = firstPlexArtworkURL(record.Artwork.Thumbnail)
@@ -5398,10 +5472,10 @@ func (s *appState) applyCachedPlexArtworkToWatchStateItem(item *watchStateItem) 
 		item.LandscapePath = landscape
 	}
 	if background := firstPlexArtworkURL(record.Artwork.Background); background != "" {
-		item.BackdropPath = background
+		item.BackdropPath = firstNonEmpty(item.BackdropPath, background)
 	}
 	if logo := firstPlexArtworkURL(record.Artwork.ClearLogo); logo != "" {
-		item.LogoPath = logo
+		item.LogoPath = firstNonEmpty(item.LogoPath, logo)
 	}
 	if item.PosterPath == "" {
 		item.PosterPath = firstPlexArtworkURL(record.Artwork.Thumbnail)
@@ -7089,6 +7163,109 @@ func watchStateKey(item watchStateItem) string {
 	return "movie:" + strings.ToLower(id)
 }
 
+func watchStateItemFromMarkRequest(req watchStateMarkRequest) watchStateItem {
+	mediaType := strings.ToLower(strings.TrimSpace(req.MediaType))
+	if mediaType == "" {
+		mediaType = watchStateMediaTypeFromRatingKey(req.RatingKey)
+	}
+	imdbID := strings.ToLower(strings.TrimSpace(req.IMDBID))
+	if imdbID == "" {
+		imdbID = imdbFromID(req.RatingKey)
+	}
+	return watchStateItem{
+		ID:          strings.TrimSpace(firstNonEmpty(req.ID, req.RatingKey)),
+		MediaType:   mediaType,
+		Title:       strings.TrimSpace(req.Title),
+		ParentTitle: strings.TrimSpace(req.ParentTitle),
+		Year:        req.Year,
+		IMDBID:      imdbID,
+		TMDBID:      req.TMDBID,
+		TVDBID:      req.TVDBID,
+		TraktID:     req.TraktID,
+		Season:      req.Season,
+		Episode:     req.Episode,
+		Source:      "vortexo-manual",
+	}
+}
+
+func watchStateMediaTypeFromRatingKey(ratingKey string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(ratingKey)), ":")
+	for _, part := range parts {
+		switch part {
+		case "movie":
+			return "movie"
+		case "episode":
+			return "episode"
+		}
+	}
+	return ""
+}
+
+func (s *appState) watchStateIndexLocked(key string, req watchStateMarkRequest) int {
+	requestID := strings.TrimSpace(firstNonEmpty(req.ID, req.RatingKey))
+	requestItem := watchStateItemFromMarkRequest(req)
+	for i := range s.watchState.Items {
+		existing := s.watchState.Items[i]
+		existingKey := watchStateKey(existing)
+		if existingKey == key {
+			return i
+		}
+		if requestID != "" && (strings.EqualFold(existing.ID, requestID) || strings.EqualFold(existingKey, requestID)) {
+			return i
+		}
+		if watchStateItemsMatch(existing, requestItem) {
+			return i
+		}
+	}
+	return -1
+}
+
+func watchStateItemsMatch(left watchStateItem, right watchStateItem) bool {
+	leftType := strings.ToLower(strings.TrimSpace(left.MediaType))
+	rightType := strings.ToLower(strings.TrimSpace(right.MediaType))
+	if leftType == "" || rightType == "" || leftType != rightType {
+		return false
+	}
+	if leftType == "episode" && (left.Season != right.Season || left.Episode != right.Episode) {
+		return false
+	}
+	if left.IMDBID != "" && right.IMDBID != "" && strings.EqualFold(left.IMDBID, right.IMDBID) {
+		return true
+	}
+	if left.TMDBID > 0 && right.TMDBID > 0 && left.TMDBID == right.TMDBID {
+		return true
+	}
+	if left.TVDBID > 0 && right.TVDBID > 0 && left.TVDBID == right.TVDBID {
+		return true
+	}
+	if left.TraktID > 0 && right.TraktID > 0 && left.TraktID == right.TraktID {
+		return true
+	}
+	return false
+}
+
+func applyWatchStateMark(item watchStateItem, watched bool, updatedAt time.Time) watchStateItem {
+	item.Watched = watched
+	item.UpdatedAt = updatedAt
+	if watched {
+		item.WatchedAt = maxTime(item.WatchedAt, updatedAt)
+		item.PlayCount = maxInt(item.PlayCount, 1)
+		item.ProgressPercent = 0
+		item.ProgressSeconds = 0
+		if key := watchStateKey(item); key != "" {
+			item.ID = key
+		}
+		return item
+	}
+
+	item.WatchedAt = time.Time{}
+	item.PlayCount = 0
+	if key := watchStateKey(item); key != "" {
+		item.ID = key
+	}
+	return item
+}
+
 func mergeWatchStateItem(existing watchStateItem, incoming watchStateItem) watchStateItem {
 	if existing.ID == "" {
 		existing.ID = watchStateKey(existing)
@@ -7136,6 +7313,13 @@ func mergeWatchStateItem(existing watchStateItem, incoming watchStateItem) watch
 	}
 	if existing.UpdatedAt.IsZero() {
 		existing.UpdatedAt = incoming.UpdatedAt
+	}
+	if existing.Watched {
+		existing.ProgressPercent = 0
+		existing.ProgressSeconds = 0
+	}
+	if key := watchStateKey(existing); key != "" {
+		existing.ID = key
 	}
 	return existing
 }
