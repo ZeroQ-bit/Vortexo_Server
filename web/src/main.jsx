@@ -1295,7 +1295,7 @@ function Setup({ perfect, setPerfect, streamingCatalogs, setStreamingCatalogs, o
                     mergeProviders: !streamingCatalogs.mergeProviders,
                   })}
                 />
-                Merge providers
+                Merge movies + shows
               </label>
             </div>
           </div>
