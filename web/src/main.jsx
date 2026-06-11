@@ -125,6 +125,7 @@ function AppContent() {
     userCode: "",
     verificationUrl: "https://trakt.tv/activate",
   });
+  const keywordRowsStatus = dashboard.tmdb_keyword_rows || {};
 
   // ============ OPTIMIZED REQUEST FUNCTION ============
   const request = useCallback(
