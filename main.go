@@ -2018,10 +2018,12 @@ func (s *appState) handleVortexoWatchState(w http.ResponseWriter, r *http.Reques
 		state.Items = append([]watchStateItem(nil), state.Items...)
 	}
 	s.mu.RUnlock()
+	state.Items = filterUnairedWatchStateItems(state.Items, false)
 	if limit > 0 && len(state.Items) > limit {
 		state.Items = limitedWatchStateItems(state.Items, limit)
 	}
 	state.Items = s.enrichWatchStateWithManifestMetadata(r.Context(), state.Items)
+	state.Items = filterUnairedWatchStateItems(state.Items, true)
 	for i := range state.Items {
 		s.applyCachedPlexArtworkToWatchStateItem(&state.Items[i])
 	}
@@ -2072,6 +2074,56 @@ func limitedWatchStateItems(items []watchStateItem, limit int) []watchStateItem 
 		return item.Watched && item.ProgressPercent <= 0 && item.ProgressSeconds <= 0
 	})
 	return limited
+}
+
+func filterUnairedWatchStateItems(items []watchStateItem, strictUpNextDate bool) []watchStateItem {
+	if len(items) == 0 {
+		return items
+	}
+	now := time.Now().UTC()
+	filtered := make([]watchStateItem, 0, len(items))
+	for _, item := range items {
+		if watchStateItemShouldDisplay(item, now, strictUpNextDate) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func watchStateItemShouldDisplay(item watchStateItem, now time.Time, strictUpNextDate bool) bool {
+	if strings.ToLower(strings.TrimSpace(item.MediaType)) != "episode" {
+		return true
+	}
+
+	source := strings.ToLower(strings.TrimSpace(item.Source))
+	isUpNext := strings.Contains(source, "trakt-up-next")
+	known, aired := watchStateDateHasAired(firstNonEmpty(item.AirDate, item.ReleaseDate), now)
+	if known {
+		return aired
+	}
+	if strictUpNextDate && isUpNext {
+		return false
+	}
+	return true
+}
+
+func watchStateDateHasAired(rawValue string, now time.Time) (bool, bool) {
+	rawValue = strings.TrimSpace(rawValue)
+	if rawValue == "" {
+		return false, false
+	}
+	if parsed, err := time.Parse(time.RFC3339, rawValue); err == nil {
+		return true, !parsed.After(now.Add(6*time.Hour))
+	}
+	if len(rawValue) > len("2006-01-02") {
+		rawValue = rawValue[:len("2006-01-02")]
+	}
+	parsed, err := time.Parse("2006-01-02", rawValue)
+	if err != nil {
+		return false, false
+	}
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	return true, !parsed.After(today)
 }
 
 func (s *appState) handleVortexoWatchStateMark(w http.ResponseWriter, r *http.Request) {
@@ -6283,7 +6335,7 @@ func (s *appState) traktUpNextWatchItems(ctx context.Context, watchedShows []tra
 		if episode.Season <= 0 || episode.Number <= 0 {
 			continue
 		}
-		if !episode.FirstAired.IsZero() && episode.FirstAired.After(now.Add(6*time.Hour)) {
+		if !traktEpisodeHasAired(episode, now) {
 			continue
 		}
 
@@ -6300,6 +6352,20 @@ func (s *appState) traktUpNextWatchItems(ctx context.Context, watchedShows []tra
 		items = append(items, item)
 	}
 	return items
+}
+
+func traktEpisodeHasAired(episode traktEpisode, now time.Time) bool {
+	if episode.FirstAired.IsZero() {
+		return false
+	}
+	return !episode.FirstAired.After(now.Add(6 * time.Hour))
+}
+
+func traktEpisodeAirDate(episode traktEpisode) string {
+	if episode.FirstAired.IsZero() {
+		return ""
+	}
+	return episode.FirstAired.UTC().Format("2006-01-02")
 }
 
 func (s *appState) traktUpNextAtomOrder(ctx context.Context) map[string]int {
@@ -10324,6 +10390,7 @@ func watchItemFromTraktEpisode(show traktShow, episode traktEpisode, watched boo
 		Watched:         watched,
 		ProgressPercent: progress,
 		PlayCount:       playCount,
+		AirDate:         traktEpisodeAirDate(episode),
 		Source:          "trakt",
 		UpdatedAt:       updatedAt,
 	}
