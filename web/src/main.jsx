@@ -74,11 +74,11 @@ const NAV = [
 ];
 
 function AppContent() {
-  const {
-    token,
-    setToken,
-    signedIn,
-    serverUrl,
+    const {
+      token,
+      setToken,
+      signedIn,
+      serverUrl,
     view,
     setView,
     message,
@@ -93,8 +93,6 @@ function AppContent() {
     setLogin,
     registry,
     setRegistry,
-    perfect,
-    setPerfect,
     streamingCatalogs,
     setStreamingCatalogs,
     keywordRows,
@@ -122,6 +120,11 @@ function AppContent() {
   } = useConfig();
 
   const [manual, setManual] = useState({ name: "", url: "" });
+  const [traktDevice, setTraktDevice] = useState({
+    code: "",
+    userCode: "",
+    verificationUrl: "https://trakt.tv/activate",
+  });
 
   // ============ OPTIMIZED REQUEST FUNCTION ============
   const request = useCallback(
@@ -201,6 +204,13 @@ function AppContent() {
           ...current,
           traktClientId: data.trakt?.client_id || "",
         }));
+        const watchState = data.watch_state || {};
+        const watchCount = watchState.count || 0;
+        setWatchStatus(
+          `Watch items: ${watchCount} · Trakt token: ${
+            data.trakt?.has_access_token ? "saved" : "missing"
+          }`
+        );
       } catch {
         // Optional panel; keep the dashboard usable.
       }
@@ -454,6 +464,422 @@ function AppContent() {
     loadLiveRows();
   }, [loadDashboard, loadPublicHome, loadLiveRows]);
 
+  const saveStreamingCatalogs = useCallback(
+    async () => {
+      if (!token) {
+        setMessage("Sign in to save streaming catalog settings.");
+        return;
+      }
+      if (streamingCatalogs.providers.length === 0) {
+        setMessage("Select at least one streaming provider.");
+        return;
+      }
+      if (streamingCatalogs.types.length === 0) {
+        setMessage("Select at least one catalog type.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await request("/api/v1/bridge/streaming-catalogs", {
+          method: "POST",
+          body: JSON.stringify({
+            install: true,
+            providers: streamingCatalogs.providers,
+            types: streamingCatalogs.types,
+            merge_providers: streamingCatalogs.mergeProviders,
+            merge_all: streamingCatalogs.mergeAll,
+            sort_by: streamingCatalogs.sortBy,
+            rpdb_key: streamingCatalogs.rpdbKey,
+          }),
+        });
+        setMessage("Streaming catalogs updated.");
+        await Promise.all([loadDashboard(), loadPublicHome(), loadLiveRows()]);
+      } catch (error) {
+        setMessage(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      token,
+      streamingCatalogs,
+      request,
+      setMessage,
+      loadDashboard,
+      loadPublicHome,
+      loadLiveRows,
+    ]
+  );
+
+  const saveKeywordRows = useCallback(
+    async () => {
+      if (!token) {
+        setMessage("Sign in to save keyword row settings.");
+        return;
+      }
+
+      const maxRows = Math.max(1, Number(keywordRowsStatus?.max_row_count || 50));
+      const rowCount = Math.max(
+        1,
+        Math.min(maxRows, Number(keywordRows.rowCount || keywordRowsStatus?.default_row_count || 10))
+      );
+      const payload = {
+        enabled: Boolean(keywordRows.enabled),
+        row_count: rowCount,
+        tmdb_api_key: (keywordRows.tmdbKey || "").trim(),
+        tmdb_access_token: (keywordRows.tmdbToken || "").trim(),
+        language: (keywordRows.language || "en-US").trim(),
+        region: (keywordRows.region || "US").trim().toUpperCase(),
+        clear_credentials: Boolean(keywordRows.clearCredentials),
+      };
+
+      if (
+        payload.enabled &&
+        !payload.tmdb_api_key &&
+        !payload.tmdb_access_token &&
+        !keywordRowsStatus?.has_api_key &&
+        !keywordRowsStatus?.has_access_token
+      ) {
+        setMessage("TMDB API key or access token is required before enabling keyword rows.");
+        return;
+      }
+
+      setBusy(true);
+      try {
+        await request("/api/v1/bridge/tmdb-keyword-rows", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        setMessage(
+          payload.enabled
+            ? "Keyword row settings saved."
+            : "Keyword rows disabled and no longer added to home."
+        );
+        setKeywordRows((current) => ({
+          ...current,
+          rowCount,
+          clearCredentials: false,
+        }));
+        await Promise.all([loadDashboard(), loadPublicHome()]);
+      } catch (error) {
+        setMessage(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      token,
+      keywordRows,
+      keywordRowsStatus,
+      setKeywordRows,
+      request,
+      setMessage,
+      loadDashboard,
+      loadPublicHome,
+    ]
+  );
+
+  const saveWatchSettings = useCallback(
+    async () => {
+      if (!token) {
+        setWatchStatus("Sign in first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await request("/api/v1/bridge/watch/settings", {
+          method: "POST",
+          body: JSON.stringify({
+            trakt_client_id: watchForm.traktClientId,
+            trakt_client_secret: watchForm.traktClientSecret,
+            trakt_access_token: watchForm.traktAccessToken,
+            trakt_refresh_token: watchForm.traktRefreshToken,
+          }),
+        });
+        setWatchForm((current) => ({
+          ...current,
+          traktClientSecret: "",
+          traktAccessToken: "",
+          traktRefreshToken: "",
+        }));
+        setWatchStatus("Watch settings saved.");
+        await Promise.all([loadWatchSettings(), loadDashboard()]);
+      } catch (error) {
+        setWatchStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, watchForm, request, setWatchForm, setWatchStatus, loadWatchSettings, loadDashboard, setMessage]
+  );
+
+  const clearTraktTokens = useCallback(
+    async () => {
+      if (!token) {
+        setWatchStatus("Sign in first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await request("/api/v1/bridge/watch/settings", {
+          method: "POST",
+          body: JSON.stringify({ clear_trakt_tokens: true }),
+        });
+        setWatchStatus("Trakt tokens cleared.");
+        await Promise.all([loadWatchSettings(), loadDashboard()]);
+      } catch (error) {
+        setWatchStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, request, loadWatchSettings, loadDashboard, setWatchStatus]
+  );
+
+  const startTraktDeviceLogin = useCallback(
+    async () => {
+      if (!token) {
+        setWatchStatus("Sign in first.");
+        return;
+      }
+      if (!watchForm.traktClientId.trim() && !dashboard.watch?.trakt_client_config) {
+        setWatchStatus("Add a Trakt client ID and save it first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/watch/trakt/device-code", {
+          method: "POST",
+          body: JSON.stringify({
+            client_id: watchForm.traktClientId,
+            client_secret: watchForm.traktClientSecret,
+          }),
+        });
+        setTraktDevice({
+          code: data.device_code || "",
+          userCode: data.user_code || "",
+          verificationUrl: data.verification_url || "https://trakt.tv/activate",
+        });
+        setWatchStatus(
+          data.user_code
+            ? `Open ${data.verification_url || "https://trakt.tv/activate"} and enter code ${data.user_code}`
+            : "Trakt device login started. Click check login when approved."
+        );
+      } catch (error) {
+        setWatchStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [
+      token,
+      request,
+      watchForm.traktClientId,
+      watchForm.traktClientSecret,
+      dashboard.watch?.trakt_client_config,
+      setWatchStatus,
+      setTraktDevice,
+    ]
+  );
+
+  const checkTraktDeviceLogin = useCallback(
+    async () => {
+      if (!token) {
+        setWatchStatus("Sign in first.");
+        return;
+      }
+      if (!traktDevice.code) {
+        setWatchStatus("No Trakt device code. Start device login first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/watch/trakt/device-token", {
+          method: "POST",
+          body: JSON.stringify({ device_code: traktDevice.code }),
+        });
+        if (!data?.has_access_token) {
+          setWatchStatus("Still waiting for Trakt approval.");
+          return;
+        }
+        setTraktDevice({
+          code: "",
+          userCode: "",
+          verificationUrl: "https://trakt.tv/activate",
+        });
+        setWatchStatus("Trakt connected.");
+        await Promise.all([loadWatchSettings(), loadDashboard()]);
+      } catch (error) {
+        setWatchStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, traktDevice.code, request, loadWatchSettings, loadDashboard, setWatchStatus, setTraktDevice]
+  );
+
+  const syncTraktWatch = useCallback(
+    async () => {
+      if (!token) {
+        setWatchStatus("Sign in first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/watch/trakt/sync", {
+          method: "POST",
+        });
+        setWatchStatus(
+          `Trakt sync imported ${data.imported || 0} items. Total watch items: ${
+            data.total || 0
+          }.`
+        );
+        await loadWatchSettings();
+      } catch (error) {
+        setWatchStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, request, loadWatchSettings, setWatchStatus]
+  );
+
+  const clearWatchHistory = useCallback(
+    async () => {
+      if (!token) {
+        setWatchStatus("Sign in first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/watch/history", {
+          method: "DELETE",
+        });
+        setWatchStatus(`Watch history cleared (${data.removed || 0} removed).`);
+        await loadWatchSettings();
+      } catch (error) {
+        setWatchStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, request, loadWatchSettings, setWatchStatus]
+  );
+
+  const savePlexSettings = useCallback(
+    async () => {
+      if (!token) {
+        setPlexStatus("Sign in first.");
+        return;
+      }
+      if (!plexAccessToken.trim()) {
+        setPlexStatus("Paste a Plex token first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await request("/api/v1/bridge/plex/settings", {
+          method: "POST",
+          body: JSON.stringify({ access_token: plexAccessToken.trim() }),
+        });
+        setPlexAccessToken("");
+        setPlexStatus("Plex connected. Artwork cache will use signed Discover data on refresh.");
+        await Promise.all([loadPlexSettings(), loadDashboard()]);
+      } catch (error) {
+        setPlexStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, plexAccessToken, request, setPlexAccessToken, setPlexStatus, loadPlexSettings, loadDashboard]
+  );
+
+  const clearPlexSettings = useCallback(
+    async () => {
+      if (!token) {
+        setPlexStatus("Sign in first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        await request("/api/v1/bridge/plex/settings", {
+          method: "POST",
+          body: JSON.stringify({ clear_token: true }),
+        });
+        setPlexStatus(
+          "Plex token cleared. Artwork will use public pages for fallback cards."
+        );
+        setPlexPin(null);
+        setPlexAccessToken("");
+        await Promise.all([loadPlexSettings(), loadDashboard()]);
+      } catch (error) {
+        setPlexStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, request, setPlexAccessToken, setPlexPin, setPlexStatus, loadPlexSettings, loadDashboard]
+  );
+
+  const startPlexLogin = useCallback(
+    async () => {
+      if (!token) {
+        setPlexStatus("Sign in first.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/plex/pin", {
+          method: "POST",
+        });
+        setPlexPin(Number(data.id || 0) || null);
+        setPlexStatus(
+          `Open ${data.verification_url || "https://plex.tv/link"} and enter code ${
+            data.code || ""
+          }. Then click check login.`
+        );
+      } catch (error) {
+        setPlexStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, request, setPlexPin, setPlexStatus]
+  );
+
+  const checkPlexLogin = useCallback(
+    async () => {
+      if (!token) {
+        setPlexStatus("Sign in first.");
+        return;
+      }
+      const pinID = Number(plexPin || 0);
+      if (!pinID) {
+        setPlexStatus("No Plex PIN saved. Start Plex login again.");
+        return;
+      }
+      setBusy(true);
+      try {
+        const data = await request("/api/v1/bridge/plex/pin/token", {
+          method: "POST",
+          body: JSON.stringify({ pin_id: pinID }),
+        });
+        if (!data?.authenticated) {
+          setPlexStatus("Still waiting for Plex approval.");
+          return;
+        }
+        setPlexPin(null);
+        setPlexStatus("Plex connected.");
+        await Promise.all([loadPlexSettings(), loadDashboard()]);
+      } catch (error) {
+        setPlexStatus(error.message);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [token, plexPin, request, setPlexPin, setPlexStatus, loadPlexSettings, loadDashboard]
+  );
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -580,13 +1006,13 @@ function AppContent() {
             )}
             {view === "setup" && (
               <Setup
-                perfect={perfect}
-                setPerfect={setPerfect}
                 streamingCatalogs={streamingCatalogs}
                 setStreamingCatalogs={setStreamingCatalogs}
                 keywordRows={keywordRows}
                 setKeywordRows={setKeywordRows}
                 keywordRowsStatus={dashboard.tmdb_keyword_rows || {}}
+                onSaveStreamingCatalogs={saveStreamingCatalogs}
+                onSaveKeywordRows={saveKeywordRows}
                 busy={busy}
               />
             )}
@@ -602,6 +1028,19 @@ function AppContent() {
                 setPlexAccessToken={setPlexAccessToken}
                 plexPin={plexPin}
                 plexStatus={plexStatus}
+                traktDeviceCode={traktDevice.code}
+                traktUserCode={traktDevice.userCode}
+                traktVerificationUrl={traktDevice.verificationUrl}
+                onSaveWatchSettings={saveWatchSettings}
+                onClearTraktTokens={clearTraktTokens}
+                onStartTraktLogin={startTraktDeviceLogin}
+                onCheckTraktLogin={checkTraktDeviceLogin}
+                onSyncTrakt={syncTraktWatch}
+                onClearWatchHistory={clearWatchHistory}
+                onSavePlexSettings={savePlexSettings}
+                onClearPlexSettings={clearPlexSettings}
+                onStartPlexLogin={startPlexLogin}
+                onCheckPlexLogin={checkPlexLogin}
                 busy={busy}
               />
             )}
@@ -1221,13 +1660,13 @@ function LiveTV({ rows, summary }) {
 }
 
 function Setup({
-  perfect,
-  setPerfect,
   streamingCatalogs,
   setStreamingCatalogs,
   keywordRows,
   setKeywordRows,
   keywordRowsStatus,
+  onSaveStreamingCatalogs,
+  onSaveKeywordRows,
   busy,
 }) {
   const streamingLayout = streamingCatalogs.mergeAll
@@ -1242,10 +1681,25 @@ function Setup({
       mergeAll: layout === "all",
       sortBy: layout === "all" ? "NEW" : streamingCatalogs.sortBy,
     });
+  const keywordMaxRows = Math.max(1, Number(keywordRowsStatus?.max_row_count || 50));
+  const defaultKeywordRows = Math.max(
+    1,
+    Number(keywordRowsStatus?.default_row_count || 10)
+  );
+  const currentKeywordRows = Math.max(
+    1,
+    Math.min(keywordMaxRows, Number(keywordRows.rowCount || defaultKeywordRows))
+  );
 
   return (
     <section className="stack">
-      <form className="panel" onSubmit={(e) => e.preventDefault()}>
+      <form
+        className="panel compact-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSaveStreamingCatalogs();
+        }}
+      >
         <div className="section-head">
           <div>
             <p className="eyebrow">Built-in catalogs</p>
@@ -1254,7 +1708,7 @@ function Setup({
           <Clapperboard size={22} />
         </div>
         <div className="choice-block">
-          <span>Providers</span>
+          <span>Catalog providers</span>
           <div className="choice-grid">
             {STREAMING_CATALOG_PROVIDERS.map(([id, label]) => (
               <label
@@ -1283,12 +1737,258 @@ function Setup({
             ))}
           </div>
         </div>
+        <div className="choice-block">
+          <span>Catalog types</span>
+          <div className="choice-grid compact-choice-grid">
+            {STREAMING_CATALOG_TYPES.map(([type, label]) => (
+              <label
+                className={
+                  streamingCatalogs.types.includes(type)
+                    ? "choice-chip selected"
+                    : "choice-chip"
+                }
+                key={type}
+              >
+                <input
+                  type="checkbox"
+                  checked={streamingCatalogs.types.includes(type)}
+                  onChange={() =>
+                    setStreamingCatalogs({
+                      ...streamingCatalogs,
+                      types: toggleArrayValue(streamingCatalogs.types, type),
+                    })
+                  }
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="choice-block">
+          <span>Merge behavior</span>
+          <div className="choice-grid compact-choice-grid">
+            <label
+              className={
+                streamingLayout === "separate" ? "choice-chip selected" : "choice-chip"
+              }
+            >
+              <input
+                type="radio"
+                checked={streamingLayout === "separate"}
+                onChange={() => setStreamingLayout("separate")}
+              />
+              Separate rows
+            </label>
+            <label
+              className={
+                streamingLayout === "provider" ? "choice-chip selected" : "choice-chip"
+              }
+            >
+              <input
+                type="radio"
+                checked={streamingLayout === "provider"}
+                onChange={() => setStreamingLayout("provider")}
+              />
+              Merge by provider
+            </label>
+            <label
+              className={
+                streamingLayout === "all" ? "choice-chip selected" : "choice-chip"
+              }
+            >
+              <input
+                type="radio"
+                checked={streamingLayout === "all"}
+                onChange={() => setStreamingLayout("all")}
+              />
+              Merge all
+            </label>
+          </div>
+          <label className="wide-field" style={{ marginTop: 8 }}>
+            <span>Sort order</span>
+            <select
+              value={streamingCatalogs.sortBy}
+              onChange={(event) =>
+                setStreamingCatalogs({
+                  ...streamingCatalogs,
+                  sortBy: event.target.value,
+                })
+              }
+            >
+              {STREAMING_CATALOG_SORTS.map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label className="wide-field">
+          <span>RPDB Key (optional)</span>
+          <input
+            value={streamingCatalogs.rpdbKey}
+            placeholder="Optional for richer ratings metadata"
+            onChange={(event) =>
+              setStreamingCatalogs({
+                ...streamingCatalogs,
+                rpdbKey: event.target.value,
+              })
+            }
+          />
+        </label>
+        <div className="form-actions">
+          <button type="submit" disabled={busy}>
+            {busy ? "Saving..." : "Save streaming catalog settings"}
+          </button>
+          <span className="small-status muted-chip">
+            {streamingCatalogs.providers.length} providers ·{" "}
+            {streamingCatalogs.types.join(", ")}
+          </span>
+        </div>
+      </form>
+
+      <form
+        className="panel compact-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSaveKeywordRows();
+        }}
+      >
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Discover rows</p>
+            <h2>TMDB keyword rows</h2>
+          </div>
+        </div>
+        <label>
+          <span>Enable keyword rows</span>
+          <input
+            type="checkbox"
+            checked={Boolean(keywordRows.enabled)}
+            onChange={(event) =>
+              setKeywordRows({
+                ...keywordRows,
+                enabled: event.target.checked,
+              })
+            }
+          />
+        </label>
+        <div className="form-grid three">
+          <label>
+            <span>Rows to add</span>
+            <input
+              type="number"
+              min={1}
+              max={keywordMaxRows}
+              value={currentKeywordRows}
+              onChange={(event) =>
+                setKeywordRows({
+                  ...keywordRows,
+                  rowCount: Number(event.target.value) || 1,
+                })
+              }
+            />
+          </label>
+          <label>
+            <span>Language</span>
+            <input
+              value={keywordRows.language}
+              onChange={(event) =>
+                setKeywordRows({
+                  ...keywordRows,
+                  language: event.target.value,
+                })
+              }
+            />
+          </label>
+          <label>
+            <span>Region</span>
+            <input
+              value={keywordRows.region}
+              onChange={(event) =>
+                setKeywordRows({
+                  ...keywordRows,
+                  region: event.target.value,
+                })
+              }
+            />
+          </label>
+        </div>
+        <div className="form-grid three">
+          <TextField
+            label="TMDB API Key"
+            value={keywordRows.tmdbKey}
+            onChange={(value) => setKeywordRows({ ...keywordRows, tmdbKey: value })}
+            placeholder="tmdb key"
+            help="Required when access token is not set."
+          />
+          <TextField
+            label="TMDB Access Token"
+            value={keywordRows.tmdbToken}
+            onChange={(value) =>
+              setKeywordRows({ ...keywordRows, tmdbToken: value })
+            }
+            placeholder="tmdb access token"
+            help="Alternative to API key for TMDB requests."
+          />
+          <label>
+            <span>Clear saved TMDB credentials</span>
+            <input
+              type="checkbox"
+              checked={Boolean(keywordRows.clearCredentials)}
+              onChange={(event) =>
+                setKeywordRows({
+                  ...keywordRows,
+                  clearCredentials: event.target.checked,
+                })
+              }
+            />
+          </label>
+        </div>
+        <div className="form-actions">
+          <button type="submit" disabled={busy}>
+            {busy ? "Saving..." : "Save keyword rows"}
+          </button>
+          <span className="small-status muted-chip">
+            {keywordRowsStatus?.has_access_token || keywordRowsStatus?.has_api_key
+              ? "Credentials available"
+              : "No saved TMDB credentials"}
+          </span>
+          <span className="small-status muted-chip">
+            Max rows: {keywordMaxRows}
+          </span>
+        </div>
       </form>
     </section>
   );
 }
 
-function WatchSync({ watch, form, setForm, status, plex, artwork, plexAccessToken, setPlexAccessToken, plexPin, plexStatus, busy }) {
+function WatchSync({
+  watch,
+  form,
+  setForm,
+  status,
+  plex,
+  artwork,
+  plexAccessToken,
+  setPlexAccessToken,
+  plexPin,
+  plexStatus,
+  traktDeviceCode,
+  traktUserCode,
+  traktVerificationUrl,
+  onSaveWatchSettings,
+  onClearTraktTokens,
+  onStartTraktLogin,
+  onCheckTraktLogin,
+  onSyncTrakt,
+  onClearWatchHistory,
+  onSavePlexSettings,
+  onClearPlexSettings,
+  onStartPlexLogin,
+  onCheckPlexLogin,
+  busy,
+}) {
   const hasTraktConfig = Boolean(
     watch.trakt_client_config || form.traktClientId.trim()
   );
@@ -1313,13 +2013,105 @@ function WatchSync({ watch, form, setForm, status, plex, artwork, plexAccessToke
           detail={connectedAccounts.join(", ") || "None"}
         />
       </div>
-      <div className="panel">
+
+      <form
+        className="panel compact-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSaveWatchSettings();
+        }}
+      >
         <div className="section-head">
           <div>
-            <p className="eyebrow">Accounts</p>
-            <h2>Watch history sync</h2>
+            <p className="eyebrow">Trakt</p>
+            <h2>Watch sync settings</h2>
           </div>
+          <Lock size={22} />
         </div>
+        <div className="form-grid three">
+          <TextField
+            label="Trakt Client ID"
+            value={form.traktClientId}
+            onChange={(value) =>
+              setForm({ ...form, traktClientId: value })
+            }
+          />
+          <TextField
+            label="Client Secret"
+            value={form.traktClientSecret}
+            onChange={(value) =>
+              setForm({ ...form, traktClientSecret: value })
+            }
+          />
+          <TextField
+            label="Access Token (optional)"
+            value={form.traktAccessToken}
+            onChange={(value) =>
+              setForm({ ...form, traktAccessToken: value })
+            }
+          />
+        </div>
+        <TextField
+          label="Refresh Token (optional)"
+          value={form.traktRefreshToken}
+          onChange={(value) => setForm({ ...form, traktRefreshToken: value })}
+        />
+        <div className="form-actions">
+          <button type="submit" disabled={busy}>
+            {busy ? "Saving..." : "Save Trakt settings"}
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={onClearTraktTokens}
+            disabled={busy}
+          >
+            Clear Trakt tokens
+          </button>
+          {traktUserCode && traktDeviceCode && (
+            <a
+              className="text-link"
+              href={traktVerificationUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open Trakt activation
+            </a>
+          )}
+        </div>
+        <div className="field-actions form-actions compact-actions">
+          <button
+            type="button"
+            onClick={onStartTraktLogin}
+            disabled={busy || !hasTraktConfig}
+          >
+            Start Trakt login
+          </button>
+          <button
+            type="button"
+            onClick={onCheckTraktLogin}
+            disabled={busy || !traktDeviceCode}
+          >
+            Check Trakt login
+          </button>
+          <button type="button" onClick={onSyncTrakt} disabled={busy}>
+            Sync Trakt history
+          </button>
+          <button
+            type="button"
+            className="danger-action"
+            onClick={onClearWatchHistory}
+            disabled={busy}
+          >
+            Clear watch items
+          </button>
+        </div>
+        {traktUserCode && (
+          <p className="muted">
+            Enter code <strong>{traktUserCode}</strong> at{" "}
+            {traktVerificationUrl}.
+          </p>
+        )}
         {status && (
           <div
             className={
@@ -1329,7 +2121,78 @@ function WatchSync({ watch, form, setForm, status, plex, artwork, plexAccessToke
             {status}
           </div>
         )}
-      </div>
+      </form>
+
+      <form
+        className="panel compact-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSavePlexSettings();
+        }}
+      >
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Plex</p>
+            <h2>Artwork + proxy credentials</h2>
+          </div>
+          <ShieldCheck size={22} />
+        </div>
+        <p className="muted">
+          Signed in users improve poster metadata and trailer lookup reliability.
+        </p>
+        <TextField
+          label="Plex Access Token"
+          value={plexAccessToken}
+          onChange={setPlexAccessToken}
+        />
+        <div className="form-actions">
+          <button
+            type="submit"
+            disabled={busy || !plexAccessToken.trim()}
+          >
+            Save Plex token
+          </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={onClearPlexSettings}
+            disabled={busy}
+          >
+            Clear Plex token
+          </button>
+          <button type="button" onClick={onStartPlexLogin} disabled={busy}>
+            Start Plex login
+          </button>
+          <button
+            type="button"
+            onClick={onCheckPlexLogin}
+            disabled={busy || !plexPin}
+          >
+            Check Plex login
+          </button>
+        </div>
+        {plexPin && (
+          <div className="inline-note">Your Plex PIN: {plexPin}</div>
+        )}
+        {plex?.has_access_token ? (
+          <div className="inline-note">
+            Plex connected.
+          </div>
+        ) : (
+          <div className="inline-note">
+            Plex not connected.
+          </div>
+        )}
+        {plexStatus && (
+          <div
+            className={
+              isErrorMessage(plexStatus) ? "inline-error" : "inline-note"
+            }
+          >
+            {plexStatus}
+          </div>
+        )}
+      </form>
     </section>
   );
 }
