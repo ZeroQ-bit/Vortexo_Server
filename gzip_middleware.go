@@ -3,6 +3,7 @@ package main
 import (
 	"compress/gzip"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -25,9 +26,22 @@ func gzipMiddleware(next http.Handler) http.Handler {
 
 func clientAcceptsGzip(r *http.Request) bool {
 	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		if strings.TrimSpace(strings.ToLower(part)) == "gzip" {
+		encoding, params, _ := strings.Cut(strings.TrimSpace(strings.ToLower(part)), ";")
+		if encoding != "gzip" {
+			continue
+		}
+		if strings.TrimSpace(params) == "" {
 			return true
 		}
+		for _, param := range strings.Split(params, ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || strings.TrimSpace(key) != "q" {
+				continue
+			}
+			quality, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			return err != nil || quality > 0
+		}
+		return true
 	}
 	return false
 }
