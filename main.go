@@ -57,6 +57,8 @@ const (
 	plexArtworkIncompleteRetryAfter = time.Hour
 	plexArtworkSyncLimit            = 500
 	plexArtworkSeedCatalogLimit     = 60
+	traktWatchSyncInitialDelay      = 45 * time.Second
+	traktWatchSyncInterval          = 30 * time.Minute
 	youtubePlayerAPIKey             = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 )
 
@@ -69,6 +71,7 @@ type appState struct {
 	dataDir                  string
 	config                   bridgeConfig
 	watchState               watchStateStore
+	watchSyncMu              sync.Mutex
 	client                   *http.Client
 	manifest                 map[string]manifestCacheEntry
 	watchMeta                map[string]watchStateMetadataCacheEntry
@@ -1243,6 +1246,7 @@ func run() error {
 	mux := http.NewServeMux()
 	state.registerRoutes(mux)
 	go state.runPlexArtworkSyncWorker(context.Background())
+	go state.runTraktWatchSyncWorker(context.Background())
 
 	addr := firstNonEmpty(os.Getenv("VORTEXO_LISTEN_ADDR"), os.Getenv("PORT"), defaultListenAddr)
 	if !strings.HasPrefix(addr, ":") && !strings.Contains(addr, ":") {
@@ -1976,6 +1980,7 @@ func (s *appState) handleTraktDeviceToken(w http.ResponseWriter, r *http.Request
 		respondError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	go s.syncTraktWatchStateIfConfigured(context.Background(), "device-login")
 	respondJSON(w, http.StatusOK, token)
 }
 
@@ -1984,7 +1989,7 @@ func (s *appState) handleTraktWatchSync(w http.ResponseWriter, r *http.Request) 
 		respondError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	items, err := s.syncTraktWatchState(r.Context())
+	items, err := s.syncTraktWatchStateExclusive(r.Context(), "manual")
 	if err != nil {
 		respondError(w, http.StatusBadGateway, err.Error())
 		return
@@ -2119,6 +2124,7 @@ func (s *appState) handleVortexoWatchStateMark(w http.ResponseWriter, r *http.Re
 		respondError(w, http.StatusInternalServerError, "failed to save watch state")
 		return
 	}
+	go s.pushWatchStateMarkToTraktAndRefresh(item)
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"ok":   true,
@@ -6136,6 +6142,48 @@ func (s *appState) pollTraktDeviceToken(ctx context.Context, deviceCode string) 
 	}, nil
 }
 
+func (s *appState) runTraktWatchSyncWorker(ctx context.Context) {
+	timer := time.NewTimer(traktWatchSyncInitialDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.syncTraktWatchStateIfConfigured(ctx, "background")
+			timer.Reset(traktWatchSyncInterval)
+		}
+	}
+}
+
+func (s *appState) traktSyncConfigured() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.config.Watch.Trakt.ClientID) != "" &&
+		strings.TrimSpace(s.config.Watch.Trakt.AccessToken) != ""
+}
+
+func (s *appState) syncTraktWatchStateIfConfigured(ctx context.Context, reason string) {
+	if !s.traktSyncConfigured() {
+		return
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	items, err := s.syncTraktWatchStateExclusive(syncCtx, reason)
+	if err != nil {
+		log.Printf("Trakt watch sync %s failed: %v", reason, err)
+		return
+	}
+	log.Printf("Trakt watch sync %s imported=%d total=%d", reason, len(items), s.watchStateCount())
+}
+
+func (s *appState) syncTraktWatchStateExclusive(ctx context.Context, reason string) ([]watchStateItem, error) {
+	_ = reason
+	s.watchSyncMu.Lock()
+	defer s.watchSyncMu.Unlock()
+	return s.syncTraktWatchState(ctx)
+}
+
 func (s *appState) syncTraktWatchState(ctx context.Context) ([]watchStateItem, error) {
 	var watchedMovies []traktWatchedMovie
 	var watchedShows []traktWatchedShow
@@ -6392,6 +6440,115 @@ func (s *appState) traktGetJSON(ctx context.Context, path string, target any) er
 		return fmt.Errorf("Trakt %s failed: HTTP %d %s", path, resp.StatusCode, responseMessage(data))
 	}
 	return json.Unmarshal(data, target)
+}
+
+func (s *appState) traktPostJSON(ctx context.Context, path string, payload any, target any) error {
+	s.mu.RLock()
+	clientID := strings.TrimSpace(s.config.Watch.Trakt.ClientID)
+	accessToken := strings.TrimSpace(s.config.Watch.Trakt.AccessToken)
+	s.mu.RUnlock()
+	if clientID == "" || accessToken == "" {
+		return fmt.Errorf("Trakt client ID and access token are required")
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.trakt.tv"+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("trakt-api-version", "2")
+	req.Header.Set("trakt-api-key", clientID)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Trakt %s failed: HTTP %d %s", path, resp.StatusCode, responseMessage(data))
+	}
+	if target == nil {
+		return nil
+	}
+	return json.Unmarshal(data, target)
+}
+
+func (s *appState) pushWatchStateMarkToTraktAndRefresh(item watchStateItem) {
+	if !s.traktSyncConfigured() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := s.pushWatchStateMarkToTrakt(ctx, item); err != nil {
+		log.Printf("Trakt watch-state push skipped: %v", err)
+		return
+	}
+	s.syncTraktWatchStateIfConfigured(ctx, "app-mark")
+}
+
+func (s *appState) pushWatchStateMarkToTrakt(ctx context.Context, item watchStateItem) error {
+	payload := traktHistoryPayloadForWatchStateItem(item)
+	if payload == nil {
+		return nil
+	}
+	path := "/sync/history/remove"
+	if item.Watched {
+		path = "/sync/history"
+	}
+	return s.traktPostJSON(ctx, path, payload, nil)
+}
+
+func traktHistoryPayloadForWatchStateItem(item watchStateItem) map[string]any {
+	mediaType := strings.ToLower(strings.TrimSpace(item.MediaType))
+	ids := traktIDsPayload(item)
+	if len(ids) == 0 {
+		return nil
+	}
+	if mediaType == "movie" {
+		movie := map[string]any{"ids": ids}
+		if item.Watched {
+			movie["watched_at"] = time.Now().UTC().Format(time.RFC3339)
+		}
+		return map[string]any{"movies": []any{movie}}
+	}
+	if mediaType == "episode" && item.Season > 0 && item.Episode > 0 {
+		episode := map[string]any{"number": item.Episode}
+		if item.Watched {
+			episode["watched_at"] = time.Now().UTC().Format(time.RFC3339)
+		}
+		show := map[string]any{
+			"ids": ids,
+			"seasons": []any{
+				map[string]any{
+					"number": item.Season,
+					"episodes": []any{
+						episode,
+					},
+				},
+			},
+		}
+		return map[string]any{"shows": []any{show}}
+	}
+	return nil
+}
+
+func traktIDsPayload(item watchStateItem) map[string]any {
+	ids := map[string]any{}
+	if imdbID := strings.TrimSpace(item.IMDBID); imdbID != "" {
+		ids["imdb"] = imdbID
+	}
+	if item.TMDBID > 0 {
+		ids["tmdb"] = item.TMDBID
+	}
+	if item.TVDBID > 0 {
+		ids["tvdb"] = item.TVDBID
+	}
+	if item.TraktID > 0 {
+		ids["trakt"] = item.TraktID
+	}
+	return ids
 }
 
 func (s *appState) handleVortexoSources(w http.ResponseWriter, r *http.Request) {

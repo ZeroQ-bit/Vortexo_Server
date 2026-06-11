@@ -716,6 +716,26 @@ function AppContent() {
       }
       setBusy(true);
       try {
+        await request("/api/v1/bridge/watch/settings", {
+          method: "POST",
+          body: JSON.stringify({
+            trakt_client_id: watchForm.traktClientId,
+            trakt_client_secret: watchForm.traktClientSecret,
+            trakt_access_token: watchForm.traktAccessToken,
+            trakt_refresh_token: watchForm.traktRefreshToken,
+            trakt_up_next_atom_url: watchForm.traktUpNextAtomUrl,
+          }),
+        });
+        if (dashboard.watch?.trakt_connected) {
+          const syncData = await request("/api/v1/bridge/watch/trakt/sync", {
+            method: "POST",
+          });
+          setWatchStatus(
+            `Trakt settings saved. Up Next synced (${syncData.total || 0} items).`
+          );
+          await Promise.all([loadWatchSettings(), loadDashboard(), loadContinueWatchingItems()]);
+          return;
+        }
         const data = await request("/api/v1/bridge/watch/trakt/device-code", {
           method: "POST",
           body: JSON.stringify({
@@ -731,8 +751,29 @@ function AppContent() {
         setWatchStatus(
           data.user_code
             ? `Open ${data.verification_url || "https://trakt.tv/activate"} and enter code ${data.user_code}`
-            : "Trakt device login started. Click check login when approved."
+            : "Trakt device login started. Waiting for approval."
         );
+        for (let attempt = 0; attempt < 24; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          try {
+            const tokenData = await request("/api/v1/bridge/watch/trakt/device-token", {
+              method: "POST",
+              body: JSON.stringify({ device_code: data.device_code || "" }),
+            });
+            if (!tokenData?.has_access_token) continue;
+            setTraktDevice({
+              code: "",
+              userCode: "",
+              verificationUrl: "https://trakt.tv/activate",
+            });
+            setWatchStatus("Trakt connected. Up Next will sync automatically.");
+            await Promise.all([loadWatchSettings(), loadDashboard(), loadContinueWatchingItems()]);
+            return;
+          } catch {
+            // Trakt returns pending until the user approves the device code.
+          }
+        }
+        setWatchStatus("Still waiting for Trakt approval. Press Start Trakt login again to continue.");
       } catch (error) {
         setWatchStatus(error.message);
       } finally {
@@ -744,7 +785,14 @@ function AppContent() {
       request,
       watchForm.traktClientId,
       watchForm.traktClientSecret,
+      watchForm.traktAccessToken,
+      watchForm.traktRefreshToken,
+      watchForm.traktUpNextAtomUrl,
       dashboard.watch?.trakt_client_config,
+      dashboard.watch?.trakt_connected,
+      loadWatchSettings,
+      loadDashboard,
+      loadContinueWatchingItems,
       setWatchStatus,
       setTraktDevice,
     ]
@@ -2164,7 +2212,7 @@ function WatchSync({
         className="panel compact-form"
         onSubmit={(event) => {
           event.preventDefault();
-          onSaveWatchSettings();
+          onStartTraktLogin();
         }}
       >
         <div className="section-head">
@@ -2210,16 +2258,8 @@ function WatchSync({
           help="Optional. Used only by this server to match Trakt's Up Next order."
         />
         <div className="form-actions">
-          <button type="submit" disabled={busy}>
-            {busy ? "Saving..." : "Save Trakt settings"}
-          </button>
-          <button
-            type="button"
-            className="secondary"
-            onClick={onClearTraktTokens}
-            disabled={busy}
-          >
-            Clear Trakt tokens
+          <button type="submit" disabled={busy || !hasTraktConfig}>
+            {busy ? "Waiting for Trakt..." : "Start Trakt login"}
           </button>
           {traktUserCode && traktDeviceCode && (
             <a
@@ -2231,33 +2271,6 @@ function WatchSync({
               Open Trakt activation
             </a>
           )}
-        </div>
-        <div className="field-actions form-actions compact-actions">
-          <button
-            type="button"
-            onClick={onStartTraktLogin}
-            disabled={busy || !hasTraktConfig}
-          >
-            Start Trakt login
-          </button>
-          <button
-            type="button"
-            onClick={onCheckTraktLogin}
-            disabled={busy || !traktDeviceCode}
-          >
-            Check Trakt login
-          </button>
-          <button type="button" onClick={onSyncTrakt} disabled={busy}>
-            Sync Trakt history
-          </button>
-          <button
-            type="button"
-            className="danger-action"
-            onClick={onClearWatchHistory}
-            disabled={busy}
-          >
-            Clear watch items
-          </button>
         </div>
         {traktUserCode && (
           <p className="muted">
