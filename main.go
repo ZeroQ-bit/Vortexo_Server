@@ -5149,7 +5149,8 @@ func (s *appState) collectManifestItems(ctx context.Context, mediaType string, l
 		if !manifestSupportsResource(entry.Manifest, "catalog") {
 			continue
 		}
-		if normalizeCatalogType(entry.Catalog.Type) != mediaType {
+		catalogType := normalizeCatalogType(entry.Catalog.Type)
+		if catalogType == "" || (catalogType != "mixed" && mediaType != "" && catalogType != mediaType) {
 			continue
 		}
 		items, err := s.fetchCatalog(ctx, entry.Base, entry.Catalog, limit+offset+25)
@@ -5417,7 +5418,7 @@ func (s *appState) searchManifestItems(ctx context.Context, query string, mediaT
 			continue
 		}
 		catalogType := normalizeCatalogType(entry.Catalog.Type)
-		if catalogType == "" || (mediaType != "" && catalogType != mediaType) {
+		if catalogType == "" || (catalogType != "mixed" && mediaType != "" && catalogType != mediaType) {
 			continue
 		}
 		if !catalogSupportsSearch(entry.Catalog) {
@@ -10027,10 +10028,18 @@ func manifestSupportsType(manifest stremioManifest, wanted string) bool {
 	if wanted == "" || len(manifest.Types) == 0 {
 		return true
 	}
+	hasKnownType := false
 	for _, raw := range manifest.Types {
-		if normalizeStremioType(raw) == wanted {
+		normalized := normalizeStremioType(raw)
+		if normalized != "" {
+			hasKnownType = true
+		}
+		if normalized == wanted {
 			return true
 		}
+	}
+	if !hasKnownType {
+		return true
 	}
 	return false
 }
@@ -10162,6 +10171,8 @@ func normalizeCatalogType(value string) string {
 		return "movie"
 	case "series", "tv", "show", "shows":
 		return "tv"
+	case "mdblist":
+		return "mixed"
 	case "mixed", "all":
 		return "mixed"
 	default:
